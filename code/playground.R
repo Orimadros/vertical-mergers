@@ -211,22 +211,22 @@ reajustes_202205 <- reajustes_202205 %>%
 # -------------------------
 # THIS IS USING THE WRONG DEFINITION OF TREATED PLANS
 #
-# treated_plans <- hospitais_planos %>%
-#   filter(cd_cnes == '0797146',
-#          cd_operadora == '368253') %>%
-#   pull(cd_plano)
-# 
-# same_insurer_untreated_plans <- hospitais_planos %>%
-#   filter(cd_operadora == '368253',
-#          !cd_plano %in% treated_plans) %>%
-#   distinct(cd_plano) %>%
-#   pull()
-# 
-# same_hospital_untreated_plans <- hospitais_planos %>%
-#   filter(cd_cnes == '0797146',
-#          cd_operadora != '368253') %>%
-#   distinct(cd_plano) %>%
-#   pull()
+treated_plans <- hospitais_planos %>%
+  filter(cd_cnes == '0797146',
+         cd_operadora == '368253') %>%
+  pull(cd_plano)
+
+same_insurer_untreated_plans <- hospitais_planos %>%
+  filter(cd_operadora == '368253',
+         !cd_plano %in% treated_plans) %>%
+  distinct(cd_plano) %>%
+  pull()
+
+same_hospital_untreated_plans <- hospitais_planos %>%
+  filter(cd_cnes == '0797146',
+         cd_operadora != '368253') %>%
+  distinct(cd_plano) %>%
+  pull()
 # -------------------------
 
 df_did_treated_attempt <- reajustes_202305 %>%
@@ -376,3 +376,6 @@ reajustes_202205 %>%
   group_by(cd_plano) %>%
   summarize(contratos = n_distinct(id_contrato)) %>%
   arrange(desc(contratos))
+
+beneficiarios_cons_202305 %>%
+  distinct(cd_plano)
