@@ -3,6 +3,7 @@ library(here)
 library(readxl)
 library(janitor)
 library(VennDiagram)
+library(did)
 
 # -------------------------------
 # LEITURA DAS BASES
@@ -135,7 +136,8 @@ single_insurer_hospitals <- hospitais_planos %>%
 
 GNDI_hospitals <- hospitais_planos %>%
   filter(str_detect(cd_cnpj_estb_saude, '44649812')) %>%
-  distinct(cd_cnes, .keep_all = TRUE)
+  distinct(cd_cnes, .keep_all = TRUE) %>%
+  drop_na(cd_cnes)
 
 Hap_hospitals <- hospitais_planos %>%
   filter(str_detect(cd_cnpj_estb_saude, '63554067'))
@@ -201,7 +203,9 @@ control_plans <- hospitais_planos %>%
 reajustes_sample <- reajustes %>%
   filter(cd_plano %in% treated_plans |
            cd_plano %in% control_plans,
-         sg_uf_contrato_reaj == 'SP')
+         cd_plano %in% municipally_bound_plans,
+         sg_uf_contrato_reaj == 'SP',
+         cd_agrupamento == 0)
 
 # We have a fucking database! Now we need to decide a date for the treatment.
 
@@ -209,7 +213,7 @@ merger_date <- as.Date('2022-02-11')
 
 # Now we have to:
 # 1) get readjustment data for the full period for that sample. CHECK
-# 2) assign treatment status based on the merger date. 
+# 2) assign treatment status based on the merger date. CHECK
 # 3) add controls. 
 # 4) estimate
 
@@ -222,31 +226,88 @@ reajustes_sample <- reajustes_sample %>%
     )
   )
 
+unique_hospitais_planos <- hospitais_planos %>%
+  select(cd_plano, no_razao) %>%
+  distinct()
 
-
-# Create a treatment status over time table
-rollout_data <- reajustes_sample %>%
-  group_by(id_contrato, dt_inic_aplicacao) %>%
+reajustes_summary <- reajustes_sample %>%
+  group_by(cd_plano) %>%
   summarize(
-    treatment_status = first(treatment_status), 
-    .groups = "drop"
+    has_0 = any(treatment_status == 0),
+    has_1 = any(treatment_status == 1)
   ) %>%
   mutate(
-    treatment_status = factor(treatment_status, levels = c(0, 1), labels = c("Not Treated", "Treated"))
-  )
+    status_type = case_when(
+      has_0 & has_1 ~ "Both",
+      has_0 ~ "Only 0",
+      has_1 ~ "Only 1"
+    )
+  ) %>%
+  left_join(unique_hospitais_planos, by = "cd_plano")
 
-# Plot treatment status over time without contract IDs
-ggplot(rollout_data, aes(x = dt_inic_aplicacao, y = id_contrato, fill = treatment_status)) +
-  geom_tile(color = "black") +
-  scale_fill_manual(values = c("skyblue", "orange")) + # Customize colors
-  labs(
-    title = "Treatment Status Rollout Over Time",
-    x = "Time",
-    y = NULL,  # Removes y-axis label
-    fill = "Treatment Status"
-  ) +
-  theme_minimal() +
-  theme(
-    axis.text.y = element_blank(), # Removes y-axis text
-    axis.ticks.y = element_blank() # Removes y-axis ticks
-  )
+reajustes_summary <- reajustes_summary %>%
+  group_by(no_razao) %>%
+  summarize(
+    total = n(),
+    never_treated = sum(status_type == "Only 0"),
+    always_treated = sum(status_type == "Only 1"),
+    both = sum(status_type == "Both")
+  ) %>%
+  arrange(desc(total))
+
+aux <- hospitais_planos %>%
+  filter(cd_operadora == 368253,
+         cd_municipio %in% treated_munics) %>%
+  distinct(cd_plano) %>%
+  pull()
+
+aux <- hospitais_planos %>%
+  filter(cd_operadora == 368253,
+         cd_municipio %in% treated_munics,
+         cd_plano %in% municipally_bound_plans) %>%
+  distinct(cd_plano) %>%
+  pull()
+
+aux2 <- hospitais_planos %>%
+  filter(cd_operadora == 368253,
+         cd_municipio %in% treated_munics) %>%
+  distinct(cd_plano) %>%
+  pull()
+
+# Existem 52 planos da Hapvida atuando em cidades com hospitais GNDI, mas
+# apenas 3 deles são MB.
+
+
+df_did <- reajustes_sample %>%
+  select(id_contrato, cd_operadora, cd_plano, dt_inic_aplicacao, percentual,
+         lg_introducao_franquia_copt, treatment_status) %>%
+  mutate(year = year(dt_inic_aplicacao),
+         id_contrato_numeric = as.numeric(as.factor(id_contrato)))
+
+df_did <- df_did %>%
+  group_by(id_contrato_numeric) %>%
+  mutate(G = ifelse(any(treatment_status == 1),
+                    min(year[treatment_status == 1]),
+                    0)) %>%
+  ungroup()
+
+# Example call:
+es_results <- att_gt(
+  yname = "percentual",
+  tname = "year",
+  idname = "id_contrato_numeric",
+  gname = "G",
+  data = df_did,
+  panel = TRUE,
+  # Choose appropriate control group, often "never treated"
+  control_group = "nevertreated",
+  allow_unbalanced_panel = TRUE
+)
+
+es_agg <- aggte(es_results, type = "dynamic")
+ggdid(es_agg)
+
+
+glimpse(df_did)
+
+
