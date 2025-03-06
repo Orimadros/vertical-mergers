@@ -136,3 +136,4 @@ ggplot(data = sp_municipalities) +
     legend.position = "bottom",
     panel.grid = element_blank()
   )
+
