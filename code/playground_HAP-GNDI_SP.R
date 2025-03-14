@@ -44,7 +44,8 @@ caracteristicas_planos <- read_csv2(here('data',
                              'caracteristicas_produtos_saude_suplementar.csv')) %>%
   clean_names()  %>%
   filter(contratacao == 'Coletivo empresarial',
-         sgmt_assistencial != 'Odontológico')
+         sgmt_assistencial != 'Odontológico') %>%
+  rename(cd_operadora = 'registro_operadora')
 
 # Identify duplicate `cd_plano` - `cd_operadora` pairs
 dopplegangers <- caracteristicas_planos %>%
@@ -65,19 +66,50 @@ caracteristicas_planos <- caracteristicas_planos %>%
 # Usamos a base de informações consolidadas dos beneficiários para identificar
 # o grupo de cidades com pelo menos um beneficiário para cada operadora
 
+beneficiarios_cons_202012 <- read_csv2(here('data', 
+                                            'raw_data',
+                                            'ANS',
+                                            'beneficiarios',
+                                            'pda-024-icb-SP-2020_12.csv')
+                                       #locale = locale(encoding = "Latin1")
+) %>%
+  clean_names()
+
+beneficiarios_cons_202012 <- beneficiarios_cons_202012 %>%
+  filter(de_contratacao_plano == 'Coletivo Empresarial',
+         de_segmentacao_plano != 'Odontológico')
+
+# Convert cd_operadora to character in both datasets
+beneficiarios_cons_202012 <- beneficiarios_cons_202012 %>%
+  mutate(cd_operadora = as.character(cd_operadora))
+
+caracteristicas_planos <- caracteristicas_planos %>%
+  mutate(cd_operadora = as.character(cd_operadora))
+
+planos_hospitalares <- caracteristicas_planos %>%
+  filter(gr_sgmt_assistencial != 'Ambulatorial') %>%
+  distinct(id_plano) %>%
+  pull()
+
+# Now perform the join
+beneficiarios_cons_202012 <- beneficiarios_cons_202012 %>%
+  left_join(
+    caracteristicas_planos %>% select(cd_plano, cd_operadora, id_plano),
+    by = c("cd_plano", "cd_operadora")
+  )
+
 beneficiarios_cons_202305 <- read_csv2(here('data', 
                                             'raw_data',
                                             'ANS',
                                             'beneficiarios',
-                                            'ben202305_SP.csv'),
-                                       locale = locale(encoding = "Latin1")
+                                            'pda-024-icb-SP-2023_05.csv')
+                                       #locale = locale(encoding = "Latin1")
 ) %>%
   clean_names()
 
-
 beneficiarios_cons_202305 <- beneficiarios_cons_202305 %>%
-  filter(de_contratacao_plano == 'COLETIVO EMPRESARIAL',
-         de_segmentacao_plano != 'ODONTOLÓGICO')
+  filter(de_contratacao_plano == 'Coletivo Empresarial',
+         de_segmentacao_plano != 'Odontológico')
 
 # Convert cd_operadora to character in both datasets
 beneficiarios_cons_202305 <- beneficiarios_cons_202305 %>%
@@ -92,6 +124,13 @@ beneficiarios_cons_202305 <- beneficiarios_cons_202305 %>%
     caracteristicas_planos %>% select(cd_plano, cd_operadora, id_plano),
     by = c("cd_plano", "cd_operadora")
   )
+
+aux <- union(
+  setdiff(beneficiarios_cons_202012 %>% distinct(id_plano) %>% pull(),
+          beneficiarios_cons_202305 %>% distinct(id_plano) %>% pull()),
+  setdiff(beneficiarios_cons_202305 %>% distinct(id_plano) %>% pull(),
+          beneficiarios_cons_202012 %>% distinct(id_plano) %>% pull())
+)
 
 # Usamos a base de relações de credenciamento para identificar as redes
 
@@ -136,13 +175,6 @@ reajustes <- bind_rows(reajustes_list) %>%
 # tirou e adicionou colunas. abaixo estão os ajustes necessários para conciliar
 # as bases.
 
-# Quais colunas são novas?
-setdiff(colnames(reajustes), colnames(reajustes_sample))
-
-# Quais colunas velhas não existem mais?
-setdiff(colnames(reajustes_sample), colnames(reajustes))
-
-
 # Colapsando colunas renomeadas:
 
 reajustes <- reajustes %>%
@@ -174,7 +206,7 @@ hospitais_planos <- hospitais_planos %>%
 # Extract unique values from the 'id_plano' column in each data frame
 set_reajustes <- unique(reajustes$id_plano)
 set_hospitais <- unique(hospitais_planos$id_plano)
-set_beneficiarios <- unique(beneficiarios_cons_202305$id_plano)
+set_beneficiarios <- unique(beneficiarios_cons_202012$id_plano)
 
 # Calculate areas and intersections
 area1 <- length(set_reajustes)
@@ -230,7 +262,7 @@ GNDI_hospitals <- hospitais_planos %>%
 
 GNDI_hospital_munics <- GNDI_hospitals %>% distinct(cd_municipio) %>% pull()
 
-hap_plans_w_GNDI <- beneficiarios_cons_202305 %>%
+hap_plans_w_GNDI <- beneficiarios_cons_202012 %>%
   filter(cd_operadora == 368253,
          cd_municipio %in% GNDI_hospital_munics) %>%
   pull(id_plano)
@@ -239,12 +271,62 @@ hap_plans_w_GNDI <- beneficiarios_cons_202305 %>%
 # beneficiarios de todos os estados. Tem planos que sobram com o filtro
 # abaixo mas que são predominantemente de tocantins, por exemplo.
 
-municipally_bound_plans <- beneficiarios_cons_202305 %>%
+municipally_bound_plans <- beneficiarios_cons_202012 %>%
   group_by(id_plano) %>%
   summarize(cidades = n_distinct(cd_municipio)) %>%
   arrange(desc(cidades)) %>%
   filter(cidades == 1) %>%
   pull(id_plano)
+
+#----------
+
+# Defining relevant markets by Hap network + GNDI hospitals
+
+# Defining treated plans as MB plans operating in municipalities where there is 
+# vertical integration between merging parties. i.e. 1) there
+# is at least one Hapvida plan with a credentialed hospital there and 
+# 2) there is at least one GNDI hospital
+
+# Defining control plans as MB plans operating in municipalities where there
+# is either hapvida plan network or GNDI hospitals, but not both.
+
+# To identify these plans we first flag municipalities that satisfy the
+# conditions above, and then find plans bound in these municipalities.
+
+hap_network_munics <- hospitais_planos %>%
+  filter(cd_operadora == 368253) %>%
+  distinct(cd_municipio) %>%
+  pull()
+
+treated_munics <- intersect(hap_network_munics, GNDI_hospital_munics)
+
+control_munics <- union(
+  setdiff(hap_network_munics, GNDI_hospital_munics),
+  setdiff(GNDI_hospital_munics, hap_beneficiarios_munics)
+)
+
+treated_plans <- hospitais_planos %>% 
+  filter(cd_municipio %in% treated_munics) %>%
+  distinct(id_plano) %>%
+  pull()
+
+control_plans <- hospitais_planos %>% 
+  filter(cd_municipio %in% control_munics) %>%
+  distinct(id_plano) %>%
+  pull()
+
+#----------
+
+# PROBLEMA: muitos hospitais Hapvida não podem ser identificados pelo seu CNPJ.
+# e.g. cnes = 6430120
+
+aux <- hospitais_planos %>%
+  filter(cd_operadora == 359017) %>%
+  count(cd_cnpj_estb_saude) %>%
+  arrange(desc(n))
+
+#----------
+# Defining relevant markets by Hap beneficiaries + GNDI hospitals
 
 # Defining treated plans as MB plans operating in municipalities where there is 
 # vertical integration between merging parties. i.e. 1) there
@@ -256,7 +338,7 @@ municipally_bound_plans <- beneficiarios_cons_202305 %>%
 # To identify these plans we first flag municipalities that satisfy the
 # conditions above, and then find plans bound in these municipalities.
 
-hap_beneficiarios_munics <- beneficiarios_cons_202305 %>%
+hap_beneficiarios_munics <- beneficiarios_cons_202012 %>%
   filter(cd_operadora == 368253) %>%
   distinct(cd_municipio) %>%
   pull()
@@ -268,12 +350,12 @@ control_munics <- union(
   setdiff(GNDI_hospital_munics, hap_beneficiarios_munics)
 )
 
-# IMPORTANTE: todos os vinte municipios com hospitais GNDI têm também
+# IMPORTANTE: todos os vinte municípios com hospitais GNDI têm também
 # beneficiários Hapvida, e estão no tratamento. Portanto, na prática,
 # os municípios controle são apenas aqueles com beneficiários Hapvida mas sem
 # hospitais GNDI.
 
-treated_plans <- beneficiarios_cons_202305 %>% 
+treated_plans <- beneficiarios_cons_202012 %>% 
   filter(cd_municipio %in% treated_munics) %>%
   distinct(id_plano) %>%
   pull()
@@ -281,31 +363,45 @@ treated_plans <- beneficiarios_cons_202305 %>%
 # DÚVIDA: definir treated_plans pela base de beneficiários retorna bem menos
 # planos do que fazendo pela base de convênios. Por que?
 
-control_plans <- beneficiarios_cons_202305 %>% 
+control_plans <- beneficiarios_cons_202012 %>% 
   filter(cd_municipio %in% control_munics) %>%
   distinct(id_plano) %>%
   pull()
 
-# IMPORTANTE: apesar do tratamento ter 20 municípios e o controle 489, os dois
-# tem numero parecido de planos (5830 vs 6231) -> tratamento seleciona
-# municípios mais brabos.
+# Comparação de controle ao longo do tempo
+# 172 control munics com base benef 202001
+# 195 control munics com base benef 202012
+# 488 control munics com base benef 202305
+
+# IMPORTANTE: apesar do tratamento ter 20 municípios e o controle 172, os dois
+# têm número parecido de planos (6520 vs 6560) -> tratamento seleciona
+# municípios mais relevantes.
+
+#----------
+
+
 
 reajustes_sample <- reajustes %>%
   filter(id_plano %in% treated_plans |
            id_plano %in% control_plans,
+         id_plano %in% planos_hospitalares,
          sg_uf_contrato_reaj == 'SP',
          cd_agrupamento == 0,
          benef_comunicado > 1) %>%
   distinct()
+
+reajustes %>% distinct(dt_inic_aplicacao)
 
 reajustes_sample_MB <- reajustes %>%
   filter(id_plano %in% treated_plans |
            id_plano %in% control_plans,
          id_plano %in% municipally_bound_plans,
+         id_plano %in% planos_hospitalares,
          sg_uf_contrato_reaj == 'SP',
          cd_agrupamento == 0,
          benef_comunicado > 1) %>%
   distinct()
+
 
 # We have a fucking database! Now we need to decide a date for the treatment.
 
@@ -319,14 +415,7 @@ reajustes_sample_MB <- reajustes %>%
 # DESCRITIVAS
 # -------------------------------
 
-# 1. Entry de planos pós-fusão
-
 merger_date <- as.Date('2022-02-11')
-
-caracteristicas_planos %>%
-  filter(cd_operadora == 368253,
-         dt_registro_plano >= merger_date | is.na(dt_registro_plano),
-         id_plano %in% municipally_bound_plans)
 
 # -------------------------------
 # TREATMENT STATUS & ESTIMATION
@@ -409,9 +498,6 @@ contract_plan_year_counts %>%
 reajustes_sample <- reajustes_sample %>%
   anti_join(contract_plans_multiple_readj, by = c("id_contrato", "id_plano"))
 
-reajustes_sample %>%
-  distinct(id_contrato, id_plano)
-
 # Step 2: Compute quantiles across contract-plan panel lengths
 # Here, we create a sequence of quantile probabilities from 0 to 1.
 quantile_probs <- seq(0, 1, by = 0.0001)
@@ -488,7 +574,103 @@ plans_with_full_data <- reajustes_sample %>%
   } %>%
   arrange(year_start)
 
+reajustes_avg_complete <- reajustes_avg %>%
+  group_by(id_plano) %>%
+  filter(n_distinct(year) == n_distinct(reajustes_avg$year)) %>%
+  ungroup() %>%
+  mutate(
+    treated = as.integer(id_plano %in% treated_plans),
+    post = as.integer(year > year(merger_date))
+  )
 
+reajustes_avg_complete_MB <- reajustes_avg_complete %>%
+  filter(id_plano %in% municipally_bound_plans)
+
+# Adding covariates to final sample
+
+# --- 1. Compute beneficiary covariates from beneficiarios_cons_202001 ---
+benef_cov <- beneficiarios_cons_202001 %>%
+  group_by(id_plano) %>%
+  summarise(
+    total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE),
+    pct_59_ou_mais = mean(de_faixa_etaria_reaj == "59 ou mais", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 2. Extract plan characteristics from caracteristicas_planos ---
+# (Assuming these variables are constant at the plan level.)
+plan_char <- caracteristicas_planos %>%
+  select(id_plano, obstetricia, abrangencia_cobertura, fator_moderador, 
+         acomodacao_hospitalar, livre_escolha) %>%
+  distinct()
+
+# --- 3. Compute hospital covariates from hospitais_planos ---
+hosp_cov <- hospitais_planos %>%
+  group_by(id_plano) %>%
+  summarise(
+    n_hospitals = n_distinct(cd_cnes),
+    .groups = "drop"
+  )
+
+# --- 4. Merge all plan-level covariates ---
+plan_cov <- benef_cov %>%
+  left_join(plan_char, by = "id_plano") %>%
+  left_join(hosp_cov, by = "id_plano")
+
+# --- Merge covariates into the final plan-year panel for both samples ---
+
+final_panel <- reajustes_avg_complete %>%
+  left_join(plan_cov, by = "id_plano")
+
+final_panel_MB <- reajustes_avg_complete_MB %>%
+  left_join(plan_cov, by = "id_plano")
+
+# --- Export both datasets to Stata (.dta) files ---
+
+write_dta(final_panel, here("data", "processed_data", "reajustes_avg_complete_benef_202012_from2015.dta"))
+write_dta(final_panel_MB, here("data", "processed_data", "reajustes_avg_complete_benef_MB_202012_from2015.dta"))
+
+
+# A amostra definida pela base de beneficiários de 2023_05 tem 1333 planos
+# A amostra definida pela base de beneficiários de 2020_12 tem 1312 planos
+# As duas amostras tem 1308 planos em comum. 
+# 2023_05 tem 25 próprios
+# 2020_12 tem 4 próprios
+
+for(x in 2015:2019) {
+  expected_years <- seq(x, 2024)
+  
+  subset_df <- reajustes_avg %>%
+    filter(year >= x) %>% 
+    group_by(id_plano) %>%
+    filter(n_distinct(year) == length(expected_years)) %>%  # keep plans with data for every year from x to 2024
+    ungroup() %>%
+    mutate(
+      treated = as.integer(id_plano %in% treated_plans),
+      post = as.integer(year > year(merger_date))
+    )
+  
+  file_name <- paste0("reajustes_avg_complete_benef_202012_from", x, ".dta")
+  write_dta(subset_df, here("data", "processed_data", file_name))
+}
+
+# Create a plan-to-municipality mapping for municipally bound plans
+munic_mapping <- beneficiarios_cons_202012 %>%
+  filter(id_plano %in% municipally_bound_plans) %>%
+  distinct(id_plano, cd_municipio)
+
+# Aggregate plan-year data to municipality-year panel
+municipality_panel <- reajustes_avg_complete %>%
+  filter(id_plano %in% municipally_bound_plans) %>%
+  left_join(munic_mapping, by = "id_plano") %>%
+  group_by(cd_municipio, year) %>%
+  summarize(
+    avg_percentual = mean(percentual_avg, na.rm = TRUE),
+    treated = mean(treated),   # average; if all plans are treated this equals 1, if all are control equals 0
+    post = mean(post),
+    n_plans = n_distinct(id_plano),
+    .groups = "drop"
+  )
 
 
 #------------------
@@ -505,8 +687,7 @@ valid_contract_plans <- reajustes_sample %>%
 
 # Step 2: Create the subsample dataset by keeping only valid contract-plans
 subsample_data <- reajustes_sample %>%
-  semi_join(valid_contract_plans, by = c("id_contrato", "id_plano")) %>%
-  filter(year > 2019)
+  semi_join(valid_contract_plans, by = c("id_contrato", "id_plano"))
 
 # checking if we have a balanced panel
 subsample_data %>%
@@ -551,7 +732,7 @@ plan_status <- subsample_data_singletons %>%
 ## (B) Plan-level continuous summaries from beneficiaries and hospitals
 
 # 1. Beneficiary summary (continuous): total beneficiaries and percentage female
-benef_summary_cont <- beneficiarios_cons_202305 %>%
+benef_summary_cont <- beneficiarios_cons_202012 %>%
   group_by(id_plano, cd_operadora) %>%
   summarise(
     total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE),
@@ -560,7 +741,7 @@ benef_summary_cont <- beneficiarios_cons_202305 %>%
   )
 
 # 2. Age distribution: calculate, for each plan, the proportion in each age group
-age_prop <- beneficiarios_cons_202305 %>%
+age_prop <- beneficiarios_cons_202012 %>%
   group_by(id_plano, cd_operadora, de_faixa_etaria) %>%
   summarise(n_age = n(), .groups = "drop") %>%
   group_by(id_plano, cd_operadora) %>%
@@ -570,7 +751,7 @@ age_prop <- beneficiarios_cons_202305 %>%
   pivot_wider(names_from = de_faixa_etaria, values_from = prop_age, values_fill = 0)
 
 # 3. Geographic coverage: calculate, for each plan, the proportion in each coverage category
-geog_prop <- beneficiarios_cons_202305 %>%
+geog_prop <- beneficiarios_cons_202012 %>%
   group_by(id_plano, cd_operadora, de_abrg_geografica_plano) %>%
   summarise(n_geog = n(), .groups = "drop") %>%
   group_by(id_plano, cd_operadora) %>%
@@ -681,9 +862,6 @@ singleton_contract_years <- contract_year_counts %>%
 subsample_data_singletons <- subsample_data %>%
   semi_join(singleton_contract_years, by = c("id_contrato", "year"))
 
-subsample_data_singletons %>% write_dta(here('data', 
-                                  'processed_data',
-                                  'df_did_singletons.dta'))
 
 #--------------------------
 
@@ -693,14 +871,14 @@ aux <- hospitais_planos %>%
   distinct(id_plano) %>%
   pull()
 
-hap_tratados_MB <- beneficiarios_cons_202305 %>%
+hap_tratados_MB <- beneficiarios_cons_202012 %>%
   filter(cd_operadora == 368253,
          cd_municipio %in% treated_munics,
          id_plano %in% municipally_bound_plans) %>%
   distinct(id_plano) %>%
   pull()
 
-hap_tratados <- beneficiarios_cons_202305 %>%
+hap_tratados <- beneficiarios_cons_202012 %>%
   filter(cd_operadora == 368253,
          cd_municipio %in% treated_munics) %>%
   distinct(id_plano) %>%
@@ -761,3 +939,220 @@ sp_municipalities %>%
   mutate(group = ifelse(is.na(treatment), "Out of Sample", treatment),
          code_muni = trim_last_char(code_muni))
 
+
+#----------
+
+# --- BENEFICIÁRIOS BRANCH ---
+
+# Define municipalities from beneficiaries data
+hap_beneficiarios_munics <- beneficiarios_cons_202012 %>%
+  filter(cd_operadora == 368253) %>%
+  distinct(cd_municipio) %>%
+  pull()
+
+# Treated and control municipalities (beneficiários approach)
+treated_munics_ben <- intersect(hap_beneficiarios_munics, GNDI_hospital_munics)
+control_munics_ben <- union(
+  setdiff(hap_beneficiarios_munics, GNDI_hospital_munics),
+  setdiff(GNDI_hospital_munics, hap_beneficiarios_munics)
+)
+
+# Define treated and control plans based on beneficiary data
+treated_plans_ben <- beneficiarios_cons_202012 %>% 
+  filter(cd_municipio %in% treated_munics_ben) %>%
+  distinct(id_plano) %>%
+  pull()
+
+control_plans_ben <- beneficiarios_cons_202012 %>% 
+  filter(cd_municipio %in% control_munics_ben) %>%
+  distinct(id_plano) %>%
+  pull()
+
+# Initial beneficiaries-based sample: plan-year observations in reajustes_avg for plans in either group
+sample_ben_initial <- reajustes_avg %>%
+  filter(id_plano %in% c(treated_plans_ben, control_plans_ben)) %>%
+  mutate(treatment = if_else(id_plano %in% treated_plans_ben, "Treated", "Control"))
+
+count_initial_ben <- sample_ben_initial %>%
+  group_by(treatment) %>%
+  summarize(n_plans = n_distinct(id_plano), .groups = "drop") %>%
+  mutate(step = "Initial", branch = "Beneficiários")
+
+# Balanced sample: only those plans with observations for every year (i.e. balanced panel)
+sample_ben_balanced <- sample_ben_initial %>%
+  group_by(id_plano) %>%
+  filter(n_distinct(year) == n_distinct(reajustes_avg$year)) %>%
+  ungroup()
+
+count_balanced_ben <- sample_ben_balanced %>%
+  group_by(treatment) %>%
+  summarize(n_plans = n_distinct(id_plano), .groups = "drop") %>%
+  mutate(step = "Balanced", branch = "Beneficiários")
+
+# --- HOSPITAL NETWORK BRANCH ---
+
+# Define municipalities from hospital network data
+hap_network_munics <- hospitais_planos %>%
+  filter(cd_operadora == 368253) %>%
+  distinct(cd_municipio) %>%
+  pull()
+
+# Treated and control municipalities (hospital network approach)
+treated_munics_net <- intersect(hap_network_munics, GNDI_hospital_munics)
+control_munics_net <- union(
+  setdiff(hap_network_munics, GNDI_hospital_munics),
+  setdiff(GNDI_hospital_munics, hap_network_munics)
+)
+
+# Define treated and control plans based on hospital network data
+treated_plans_net <- hospitais_planos %>% 
+  filter(cd_municipio %in% treated_munics_net) %>%
+  distinct(id_plano) %>%
+  pull()
+
+control_plans_net <- hospitais_planos %>% 
+  filter(cd_municipio %in% control_munics_net) %>%
+  distinct(id_plano) %>%
+  pull()
+
+# Initial hospital network-based sample
+sample_net_initial <- reajustes_avg %>%
+  filter(id_plano %in% c(treated_plans_net, control_plans_net)) %>%
+  mutate(treatment = if_else(id_plano %in% treated_plans_net, "Treated", "Control"))
+
+count_initial_net <- sample_net_initial %>%
+  group_by(treatment) %>%
+  summarize(n_plans = n_distinct(id_plano), .groups = "drop") %>%
+  mutate(step = "Initial", branch = "Hospital Network")
+
+# Balanced sample for hospital network branch
+sample_net_balanced <- sample_net_initial %>%
+  group_by(id_plano) %>%
+  filter(n_distinct(year) == n_distinct(reajustes_avg$year)) %>%
+  ungroup()
+
+count_balanced_net <- sample_net_balanced %>%
+  group_by(treatment) %>%
+  summarize(n_plans = n_distinct(id_plano), .groups = "drop") %>%
+  mutate(step = "Balanced", branch = "Hospital Network")
+
+# --- Combine the counts for reporting ---
+report <- bind_rows(count_initial_ben, count_balanced_ben, count_initial_net, count_balanced_net) %>%
+  select(branch, step, treatment, n_plans)
+
+#-------
+
+# ------------------------------
+# Helper function (no geographic coverage)
+# ------------------------------
+create_balance_table_no_geog <- function(sample_df, branch, step) {
+  
+  # Create plan-level status using only id_plano and the treatment indicator.
+  plan_status <- sample_df %>%
+    distinct(id_plano, treatment) %>%
+    mutate(treated = if_else(treatment == "Treated", 1, 0))
+  
+  # 1. Beneficiary summary: total beneficiaries and percentage female
+  benef_summary_cont <- beneficiarios_cons_202012 %>%
+    group_by(id_plano) %>%
+    summarise(
+      total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE),
+      pct_female = mean(tp_sexo == "F", na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # 2. Age distribution: calculate, for each plan, the proportion in each age group
+  age_prop <- beneficiarios_cons_202012 %>%
+    group_by(id_plano, de_faixa_etaria) %>%
+    summarise(n_age = n(), .groups = "drop") %>%
+    group_by(id_plano) %>%
+    mutate(prop_age = n_age / sum(n_age)) %>%
+    ungroup() %>%
+    select(id_plano, de_faixa_etaria, prop_age) %>%
+    pivot_wider(names_from = de_faixa_etaria, values_from = prop_age, values_fill = 0)
+  
+  # 3. Hospital summary: number of distinct hospitals and average moderator factor
+  hosp_summary <- hospitais_planos %>%
+    group_by(id_plano) %>%
+    summarise(
+      num_hospitals = n_distinct(cd_cnes),
+      avg_fator_moderador = mean(lg_fator_moderador, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Merge summaries with plan-level status
+  combined <- plan_status %>%
+    left_join(benef_summary_cont, by = "id_plano") %>%
+    left_join(age_prop, by = "id_plano") %>%
+    left_join(hosp_summary, by = "id_plano")
+  
+  # Helper function for t-tests
+  balance_test <- function(var) {
+    t_res <- t.test(get(var) ~ treated, data = combined)
+    data.frame(
+      Variable = var,
+      Treated_Mean = mean(combined[[var]][combined$treated == 1], na.rm = TRUE),
+      Control_Mean = mean(combined[[var]][combined$treated == 0], na.rm = TRUE),
+      p_value = t_res$p.value
+    )
+  }
+  
+  # Run t-tests for the continuous variables from the beneficiary and hospital summaries
+  vars_cont <- c("total_benef", "pct_female", "num_hospitals", "avg_fator_moderador")
+  balance_cont <- do.call(rbind, lapply(vars_cont, balance_test))
+  
+  # Run t-tests for age distribution proportions (all columns from age_prop except id_plano)
+  age_vars <- setdiff(names(age_prop), "id_plano")
+  balance_age <- do.call(rbind, lapply(age_vars, balance_test))
+  
+  # Combine results
+  balance_all <- bind_rows(balance_cont, balance_age) %>%
+    mutate(Branch = branch, Step = step)
+  
+  # Format numeric columns for reporting
+  balance_all <- balance_all %>%
+    mutate(across(c(Treated_Mean, Control_Mean), ~ formatC(.x, format = "f", digits = 2)),
+           p_value = formatC(p_value, format = "e", digits = 2))
+  
+  return(balance_all)
+}
+
+# ------------------------------
+# Apply the function to each subgroup
+# ------------------------------
+
+# Beneficiários branch:
+balance_ben_initial   <- create_balance_table_no_geog(sample_ben_initial, branch = "Beneficiários", step = "Initial")
+balance_ben_balanced  <- create_balance_table_no_geog(sample_ben_balanced, branch = "Beneficiários", step = "Balanced")
+
+# Combine the two beneficiaries subgroups into one table.
+balance_ben <- bind_rows(balance_ben_initial, balance_ben_balanced)
+
+# Network branch:
+balance_net_initial   <- create_balance_table_no_geog(sample_net_initial, branch = "Network", step = "Initial")
+balance_net_balanced  <- create_balance_table_no_geog(sample_net_balanced, branch = "Network", step = "Balanced")
+
+# Combine the two network subgroups into one table.
+balance_net <- bind_rows(balance_net_initial, balance_net_balanced)
+
+# ------------------------------
+# Report: one table for each branch
+# ------------------------------
+
+# Beneficiários balance check table:
+balance_ben %>%
+  kable(format = "html", caption = "Balance Check – Beneficiários Branch", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  column_spec(1, width = "20em") %>%
+  column_spec(2, width = "10em") %>%
+  column_spec(3, width = "10em") %>%
+  print()
+
+# Network balance check table:
+balance_net %>%
+  kable(format = "html", caption = "Balance Check – Network Branch", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  column_spec(1, width = "20em") %>%
+  column_spec(2, width = "10em") %>%
+  column_spec(3, width = "10em") %>%
+  print()
