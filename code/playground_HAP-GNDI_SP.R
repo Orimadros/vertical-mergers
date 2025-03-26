@@ -14,6 +14,8 @@ library(knitr)
 library(kableExtra)
 library(haven)
 library(arrow)
+library(flextable)
+library(webshot2)
 
 
 # -------------------------------
@@ -156,7 +158,7 @@ hospitais_planos <- hospitais_planos %>%
     de_clas_estb_saude == 'Assistencia Hospitalar'
   )
 
-# Usamos a base de reajustes_202305 de planos coletivos para obter nossa
+# Usamos a base de reajustes de planos coletivos para obter nossa
 # variável dependente
 
 # Define the range of months
@@ -390,8 +392,6 @@ reajustes_sample <- reajustes %>%
          benef_comunicado > 1) %>%
   distinct()
 
-reajustes %>% distinct(dt_inic_aplicacao)
-
 reajustes_sample_MB <- reajustes %>%
   filter(id_plano %in% treated_plans |
            id_plano %in% control_plans,
@@ -589,7 +589,7 @@ reajustes_avg_complete_MB <- reajustes_avg_complete %>%
 # Adding covariates to final sample
 
 # --- 1. Compute beneficiary covariates from beneficiarios_cons_202001 ---
-benef_cov <- beneficiarios_cons_202001 %>%
+benef_cov <- beneficiarios_cons_202012 %>%
   group_by(id_plano) %>%
   summarise(
     total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE),
@@ -625,12 +625,246 @@ final_panel <- reajustes_avg_complete %>%
 final_panel_MB <- reajustes_avg_complete_MB %>%
   left_join(plan_cov, by = "id_plano")
 
+
+# 2.1 Create indicators
+final_panel <- final_panel %>%
+  mutate(
+    obstetric_coverage = if_else(obstetricia == "Com Obstetrícia", 1, 0),
+    copayment = if_else(fator_moderador %in% c("Coparticipação", "Franquia + Coparticipação"), 1, 0),
+    individual_accommodations = if_else(acomodacao_hospitalar == "Individual", 1, 0)
+  )
+
+# 2.2 Dictionaries for the multi-level categorical variables
+abrangencia_labels <- c(
+  "Nacional"            = "National Coverage",
+  "Estadual"            = "State Coverage",
+  "Grupo de municípios" = "Group of Municipalities Coverage",
+  "Grupo de estados"    = "Group of States Coverage"
+)
+
+# Changed label from "Full Free Choice" to "Full Out-of-Network Coverage"
+livre_escolha_labels <- c(
+  "Não se aplica"         = "Not Applicable",
+  "Total"                 = "Full Out-of-Network Coverage"
+)
+
+# 2.3 Recode the original variables using these dictionaries
+final_panel <- final_panel %>%
+  mutate(
+    abrangencia_cobertura_recode = if_else(
+      abrangencia_cobertura %in% names(abrangencia_labels),
+      abrangencia_labels[abrangencia_cobertura],
+      abrangencia_cobertura
+    ),
+    livre_escolha_recode = if_else(
+      livre_escolha %in% names(livre_escolha_labels),
+      livre_escolha_labels[livre_escolha],
+      livre_escolha
+    )
+  )
+
+
 # --- Export both datasets to Stata (.dta) files ---
 
 write_dta(final_panel, here("data", "processed_data", "reajustes_avg_complete_benef_202012_from2015.dta"))
 write_dta(final_panel_MB, here("data", "processed_data", "reajustes_avg_complete_benef_MB_202012_from2015.dta"))
 
+#--------
+# Producing descriptive tables
 
+#-------------------------------------------------
+# 1. Compute the number of plans in each group
+#-------------------------------------------------
+n_control_plans <- final_panel %>%
+  filter(treated == 0) %>%
+  distinct(id_plano) %>%
+  nrow()
+
+n_treated_plans <- final_panel %>%
+  filter(treated == 1) %>%
+  distinct(id_plano) %>%
+  nrow()
+
+n_diff <- n_treated_plans - n_control_plans
+
+#-------------------------------------------------
+# 2. Helper function to compute stats with significance
+#-------------------------------------------------
+compute_stats <- function(vec, group_var) {
+  vec_control <- vec[group_var == 0]
+  vec_treated <- vec[group_var == 1]
+  
+  mean_control <- mean(vec_control, na.rm = TRUE)
+  sd_control   <- sd(vec_control, na.rm = TRUE)
+  mean_treated <- mean(vec_treated, na.rm = TRUE)
+  sd_treated   <- sd(vec_treated, na.rm = TRUE)
+  
+  n_control <- sum(group_var == 0, na.rm = TRUE)
+  n_treated <- sum(group_var == 1, na.rm = TRUE)
+  
+  diff_val <- mean_treated - mean_control
+  diff_se  <- sqrt((sd_control^2 / n_control) + (sd_treated^2 / n_treated))
+  
+  # Welch's degrees of freedom
+  if (n_control < 2 | n_treated < 2) {
+    df <- Inf
+  } else {
+    df <- ((sd_control^2 / n_control + sd_treated^2 / n_treated)^2) / 
+      (((sd_control^2 / n_control)^2)/(n_control - 1) + ((sd_treated^2 / n_treated)^2)/(n_treated - 1))
+    if (is.na(df) || df <= 0) df <- Inf
+  }
+  
+  t_val <- diff_val / diff_se
+  p_val <- 2 * pt(-abs(t_val), df)
+  
+  sig <- ifelse(p_val < 0.01, "***",
+                ifelse(p_val < 0.05, "**",
+                       ifelse(p_val < 0.10, "*", "")))
+  
+  list(
+    control = sprintf("%.2f (%.2f)", mean_control, sd_control),
+    treated = sprintf("%.2f (%.2f)", mean_treated, sd_treated),
+    diff    = sprintf("%.2f (%.2f)%s", diff_val, diff_se, sig)
+  )
+}
+
+#-------------------------------------------------
+# 3. Build the final table row by row
+#-------------------------------------------------
+rows_list <- list()
+
+# 3.1 Insert row for the number of plans in each group
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Number of Plans",
+  Control    = as.character(n_control_plans),
+  Treated    = as.character(n_treated_plans),
+  Difference = as.character(n_diff),
+  stringsAsFactors = FALSE
+)
+
+# 3.2 Network Size
+res_net <- compute_stats(final_panel$n_hospitals, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Network Size",
+  Control    = res_net$control,
+  Treated    = res_net$treated,
+  Difference = res_net$diff,
+  stringsAsFactors = FALSE
+)
+
+# 3.3 Total Beneficiaries
+res_benef <- compute_stats(final_panel$total_benef, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Total Beneficiaries",
+  Control    = res_benef$control,
+  Treated    = res_benef$treated,
+  Difference = res_benef$diff,
+  stringsAsFactors = FALSE
+)
+
+# 3.4 Percentage Aged 59+ (convert fraction to %)
+res_59 <- compute_stats(final_panel$pct_59_ou_mais * 100, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Percentage Aged 59+",
+  Control    = res_59$control,
+  Treated    = res_59$treated,
+  Difference = res_59$diff,
+  stringsAsFactors = FALSE
+)
+
+# 3.5 Percentage with Obstetric Coverage
+res_ob <- compute_stats(final_panel$obstetric_coverage * 100, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Percentage with Obstetric Coverage",
+  Control    = res_ob$control,
+  Treated    = res_ob$treated,
+  Difference = res_ob$diff,
+  stringsAsFactors = FALSE
+)
+
+# 3.6 Geographic Coverage (recode) - multi-level
+levels_abr <- sort(unique(final_panel$abrangencia_cobertura_recode))
+for (lev in levels_abr) {
+  vec_cat <- as.numeric(final_panel$abrangencia_cobertura_recode == lev) * 100
+  row_name <- paste("Percentage with", lev)
+  
+  res_cat <- compute_stats(vec_cat, final_panel$treated)
+  rows_list[[length(rows_list) + 1]] <- data.frame(
+    Variable   = row_name,
+    Control    = res_cat$control,
+    Treated    = res_cat$treated,
+    Difference = res_cat$diff,
+    stringsAsFactors = FALSE
+  )
+}
+
+# 3.7 Percentage with Copayment
+res_co <- compute_stats(final_panel$copayment * 100, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Percentage with Copayment",
+  Control    = res_co$control,
+  Treated    = res_co$treated,
+  Difference = res_co$diff,
+  stringsAsFactors = FALSE
+)
+
+# 3.8 Free Choice (recode) - multi-level
+excluded_categories <- c("Ausente", "Parcial com internação", "Parcial sem internação")
+valid_indices <- !final_panel$livre_escolha %in% excluded_categories
+
+levels_le <- sort(unique(final_panel$livre_escolha_recode))
+for (lev in levels_le) {
+  vec_le <- rep(0, nrow(final_panel))
+  vec_le[final_panel$livre_escolha_recode == lev & valid_indices] <- 1
+  vec_le <- vec_le * 100
+  
+  if (sum(vec_le) == 0) next
+  
+  row_name <- paste("Percentage with", lev)
+  res_le <- compute_stats(vec_le, final_panel$treated)
+  
+  rows_list[[length(rows_list) + 1]] <- data.frame(
+    Variable   = row_name,
+    Control    = res_le$control,
+    Treated    = res_le$treated,
+    Difference = res_le$diff,
+    stringsAsFactors = FALSE
+  )
+}
+
+# 3.9 Percentage with Individual Accommodations
+res_ac <- compute_stats(final_panel$individual_accommodations * 100, final_panel$treated)
+rows_list[[length(rows_list) + 1]] <- data.frame(
+  Variable   = "Percentage with Individual Accommodations",
+  Control    = res_ac$control,
+  Treated    = res_ac$treated,
+  Difference = res_ac$diff,
+  stringsAsFactors = FALSE
+)
+
+# Combine all rows into a single data frame
+final_table <- do.call(rbind, rows_list)
+
+#-------------------------------------------------
+# STEP 5: CREATE A PUBLICATION-QUALITY TABLE
+#-------------------------------------------------
+ft_final <- flextable(final_table) %>%
+  set_header_labels(
+    Variable   = "Variable",
+    Control    = "Control",
+    Treated    = "Treated",
+    Difference = "Difference"
+  ) %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  fontsize(size = 10, part = "all") %>%
+  align(align = "center", part = "all")
+
+# Save the flextable as a PNG image (named "final_descriptive_table.png")
+save_as_image(ft_final, path = here('data', 'images', "descriptive_table.png"))
+
+#--------
+final_panel %>% distinct(livre_escolha_recode)
 # A amostra definida pela base de beneficiários de 2023_05 tem 1333 planos
 # A amostra definida pela base de beneficiários de 2020_12 tem 1312 planos
 # As duas amostras tem 1308 planos em comum. 
@@ -903,36 +1137,75 @@ df_did <- reajustes_sample_MB %>%
 
 # ---------------
 
+# -----------------------------
+# Load Required Packages
+# -----------------------------
+library(tidyverse)
+library(geobr)
+library(sf)
+
+# -----------------------------
+# Define Helper Function
+# -----------------------------
+# This function removes the last digit from the municipality code
+# and converts the result to numeric.
 trim_last_char <- function(column) {
   as.numeric(substr(as.character(column), 1, nchar(column) - 1))
 }
 
-# Load São Paulo municipalities (SP state has code 35)
+# -----------------------------
+# 1. Read Municipality Shapes
+# -----------------------------
+# Here we read municipality shapes for the state of São Paulo (code_muni = 35)
+# and apply the trim_last_char function so the codes become numeric.
 sp_municipalities <- read_municipality(code_muni = 35, year = 2020) %>%
   mutate(code_muni = trim_last_char(code_muni))
 
+# -----------------------------
+# 2. Define Treated and Control Municipality Codes
+# -----------------------------
+# Replace these example codes with the actual codes in your dataset.
+
+# We combine them and label them as "treated" or "control."
+# Convert them to numeric so they match sp_municipalities$code_muni.
 munics <- c(treated_munics, control_munics)
-munic_treatment <- c(rep('treated', length(treated_munics)),
-                rep('control', length(control_munics)))
-munics_map <- tibble(code_muni = munics,
-                     treatment = munic_treatment)
+munic_treatment <- c(rep("treated", length(treated_munics)),
+                     rep("control", length(control_munics)))
+
+munics_map <- tibble(
+  code_muni  = as.numeric(munics),    # ensure numeric
+  treatment  = munic_treatment
+)
+
+# -----------------------------
+# 3. Join and Classify
+# -----------------------------
+# We join sp_municipalities with munics_map by "code_muni"
+# and classify any municipality not in munics_map as "Out of Sample."
 sp_municipalities <- sp_municipalities %>%
   left_join(munics_map, by = "code_muni") %>%
   mutate(group = ifelse(is.na(treatment), "Out of Sample", treatment))
 
+# -----------------------------
+# 4. Plot the Map
+# -----------------------------
+# We use ggplot2 to visualize which municipalities are treated vs. control.
 ggplot(data = sp_municipalities) +
-  geom_sf(aes(fill = group), color = "white", size = 0.2) +  # Fill based on group
+  geom_sf(aes(fill = group), color = "white", size = 0.2) +
   scale_fill_manual(
     values = c("treated" = "orange", "control" = "darkcyan", "Out of Sample" = "lightgrey"),
     name = "Group"
   ) +
-  labs(title = "Treatment Status of Municipalities",
-       caption = "Data source: IBGE") +
+  labs(
+    title = "Treatment Status of Municipalities in São Paulo",
+    caption = "Data source: IBGE & geobr"
+  ) +
   theme_minimal() +
   theme(
     legend.position = "bottom",
     panel.grid = element_blank()
   )
+
 
 sp_municipalities %>%
   left_join(munics_map, by = "code_muni") %>%
@@ -1156,3 +1429,5 @@ balance_net %>%
   column_spec(2, width = "10em") %>%
   column_spec(3, width = "10em") %>%
   print()
+
+
