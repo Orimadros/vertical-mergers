@@ -2,3 +2,13 @@
 .DS_Store
 .Rhistory
 .Rproj.user
+data/processed_data/beneficiarios_2015.csv
+data/processed_data/beneficiarios_2016.csv
+data/processed_data/beneficiarios_2017.csv
+data/processed_data/beneficiarios_2018.csv
+data/processed_data/beneficiarios_2019.csv
+data/processed_data/beneficiarios_2020.csv
+data/processed_data/beneficiarios_2021.csv
+data/processed_data/beneficiarios_2022.csv
+data/processed_data/beneficiarios_2023.csv
+data/processed_data/beneficiarios_2024.csv

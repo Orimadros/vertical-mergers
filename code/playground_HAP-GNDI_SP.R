@@ -127,13 +127,6 @@ beneficiarios_cons_202305 <- beneficiarios_cons_202305 %>%
     by = c("cd_plano", "cd_operadora")
   )
 
-aux <- union(
-  setdiff(beneficiarios_cons_202012 %>% distinct(id_plano) %>% pull(),
-          beneficiarios_cons_202305 %>% distinct(id_plano) %>% pull()),
-  setdiff(beneficiarios_cons_202305 %>% distinct(id_plano) %>% pull(),
-          beneficiarios_cons_202012 %>% distinct(id_plano) %>% pull())
-)
-
 # Usamos a base de relações de credenciamento para identificar as redes
 
 # Set directory where Parquet files are stored
@@ -179,6 +172,14 @@ reajustes <- bind_rows(reajustes_list) %>%
 
 # Colapsando colunas renomeadas:
 
+relevant_plans <- caracteristicas_planos %>%
+  filter(
+    contratacao == 'Coletivo empresarial',
+    gr_sgmt_assistencial != 'Ambulatorial'
+  ) %>%
+  distinct(id_plano) %>%
+  pull()
+
 reajustes <- reajustes %>%
   mutate(
     benef_comunicado = coalesce(qt_benef_comunicado, benef_comunicado),
@@ -190,8 +191,13 @@ reajustes <- reajustes %>%
          "lg_negociacao") %>%
   filter(cd_agrupamento == 0,
          is.na(lg_negociacao) | lg_negociacao != 1,
-         lg_parcelado != 1) %>%
+         lg_parcelado != 1,
+         id_plano %in% relevant_plans
+         ) %>%
   mutate(percentual = as.numeric(gsub(",", ".", percentual)))
+
+
+  
 
 # O cd_agrupamento == 0 tira planos empresariais com menos de 30 vidas, cujos 
 # reajustes são negociados de forma agrupada por operadora.
@@ -370,6 +376,8 @@ control_plans <- beneficiarios_cons_202012 %>%
   distinct(id_plano) %>%
   pull()
 
+intersect(control_plans, treated_plans)
+
 # Comparação de controle ao longo do tempo
 # 172 control munics com base benef 202001
 # 195 control munics com base benef 202012
@@ -378,9 +386,6 @@ control_plans <- beneficiarios_cons_202012 %>%
 # IMPORTANTE: apesar do tratamento ter 20 municípios e o controle 172, os dois
 # têm número parecido de planos (6520 vs 6560) -> tratamento seleciona
 # municípios mais relevantes.
-
-#----------
-
 
 
 reajustes_sample <- reajustes %>%
@@ -1138,13 +1143,6 @@ df_did <- reajustes_sample_MB %>%
 # ---------------
 
 # -----------------------------
-# Load Required Packages
-# -----------------------------
-library(tidyverse)
-library(geobr)
-library(sf)
-
-# -----------------------------
 # Define Helper Function
 # -----------------------------
 # This function removes the last digit from the municipality code
@@ -1430,4 +1428,178 @@ balance_net %>%
   column_spec(3, width = "10em") %>%
   print()
 
+# ------------------------------
+# Estimating with municipality-level aggregation
+# ------------------------------
 
+# To estimate in the municipality level, we're gonna need beneficiary data for
+# all years to calculate the weighted average of readjustments for each year.
+
+
+
+# =============================================================================
+# PART 1: CONVERT CSV FILES TO PARQUET BY YEAR (PROCESS EACH YEAR SEPARATELY)
+# =============================================================================
+years <- 2015:2024
+
+for (yr in years) {
+  
+  # Folder where raw CSV files for the year reside.
+  folder_path <- here("data", "raw_data", "ANS", "beneficiarios", as.character(yr))
+  
+  # Pattern to match CSV files (assumes filenames like "pda-024-icb-<state>-<year>_12.csv")
+  file_pattern <- paste0("pda-024-icb-.*-", yr, "_12\\.csv$")
+  
+  # Get all matching CSV file paths for the year
+  csv_files <- list.files(path = folder_path, pattern = file_pattern, full.names = TRUE)
+  
+  # Create (or use) a subfolder for the Parquet files, e.g. "parquet" inside the year folder:
+  parquet_folder <- file.path(folder_path, "parquet")
+  if (!dir.exists(parquet_folder)) {
+    dir.create(parquet_folder)
+  }
+  
+  cat("Processing year", yr, "\n")
+  
+  # Loop over each CSV file and convert it to Parquet
+  for (csv_file in csv_files) {
+    # Define the output parquet filename by replacing the .csv extension
+    parquet_file <- file.path(parquet_folder, 
+                              gsub("\\.csv$", ".parquet", basename(csv_file)))
+    
+    # Skip conversion if the Parquet file already exists
+    if (file.exists(parquet_file)) next
+    
+    # Read and process the CSV file (using read_csv2 for semicolon-delimited files)
+    df <- read_csv2(csv_file, locale = locale(encoding = "latin1"), show_col_types = FALSE) %>%
+      clean_names() %>%
+      # Rename the beneficiary column (handle variations)
+      rename(id_cmpt_movel = any_of(c("id_cmpt_movel", "#id_cmpt_movel", "number_id_cmpt_movel"))) %>%
+      # Standardize id_cmpt_movel: if missing a hyphen, insert one between the 4th and 5th characters
+      mutate(
+        id_cmpt_movel = case_when(
+          str_detect(as.character(id_cmpt_movel), "-") ~ as.character(id_cmpt_movel),
+          TRUE ~ paste0(substr(as.character(id_cmpt_movel), 1, 4), "-", 
+                        substr(as.character(id_cmpt_movel), 5, 6))
+        ),
+        dt_carga = as.character(dt_carga),
+        cd_operadora = as.character(cd_operadora),
+        year = yr
+      ) %>%
+      # Filter rows: keep only the desired contracting types and exclude "odontol[óo]gico"
+      filter(
+        str_to_lower(de_contratacao_plano) %in% c("coletivo empresarial", "coletivo por adesão"),
+        !str_detect(str_to_lower(de_segmentacao_plano), "odontol[óo]gico")
+      ) %>%
+      # Join with 'caracteristicas_planos' to get plan details (if available)
+      left_join(
+        caracteristicas_planos %>% select(cd_plano, cd_operadora, id_plano),
+        by = c("cd_plano", "cd_operadora")
+      ) %>%
+      # Select only desired columns
+      select(
+        id_cmpt_movel,
+        cd_operadora,
+        nm_razao_social,
+        nr_cnpj,
+        modalidade_operadora,
+        sg_uf,
+        cd_municipio,
+        tp_sexo,
+        de_faixa_etaria,
+        de_faixa_etaria_reaj,
+        cd_plano,
+        de_contratacao_plano,
+        de_abrg_geografica_plano,
+        qt_beneficiario_ativo,
+        dt_carga,
+        id_plano,
+        year
+      )
+    
+    # Write the processed data to a Parquet file
+    write_parquet(df, parquet_file)
+    
+    rm(df)
+    gc()
+  }
+  cat("Completed conversion for year", yr, "\n")
+}
+
+# =============================================================================
+# PART 2: CREATE A LAZY ARROW DATASET FOR ALL YEARS
+# =============================================================================
+# List all the Parquet files across years
+parquet_files_all <- unlist(lapply(years, function(yr) {
+  folder_path <- file.path(here("data", "raw_data", "ANS", "beneficiarios", as.character(yr), "parquet"))
+  list.files(path = folder_path, pattern = "\\.parquet$", full.names = TRUE)
+}))
+
+# Open a lazy Arrow dataset (the actual data is not loaded until you "collect()")
+ds <- open_dataset(parquet_files_all, format = "parquet")
+
+# =============================================================================
+# PART 3: EXAMPLE ANALYSIS USING LAZY EVALUATION
+# =============================================================================
+# Example: Calculate baseline market shares using only 2020 data.
+baseline_market_shares <- ds %>%
+  filter(year == 2020) %>%
+  group_by(cd_municipio) %>%
+  mutate(total_benef_munic = sum(qt_beneficiario_ativo)) %>%
+  group_by(cd_municipio, cd_operadora) %>%
+  summarize(
+    insurer_benef = sum(qt_beneficiario_ativo),
+    total_benef = first(total_benef_munic),
+    market_share = insurer_benef / total_benef
+  ) %>%
+  collect()  # collect() pulls the small summary into memory
+
+# Define treatment groups based on 2020 data
+hap_benef_50_munics <- baseline_market_shares %>%
+  filter(cd_operadora == "368253", insurer_benef >= 50) %>%
+  pull(cd_municipio)
+
+GNDI_benef_50_munics <- baseline_market_shares %>%
+  filter(cd_operadora == "359017", insurer_benef >= 50) %>%
+  pull(cd_municipio)
+
+treated_munics <- intersect(hap_benef_50_munics, GNDI_benef_50_munics)
+control_munics <- union(
+  setdiff(hap_benef_50_munics, GNDI_benef_50_munics),
+  setdiff(GNDI_benef_50_munics, hap_benef_50_munics)
+)
+
+# Now, if you need to calculate market shares across all years without loading everything,
+# you can write further dplyr code on the lazy dataset (ds) and only collect a summary.
+
+market_shares <- ds %>%
+  group_by(cd_municipio, year) %>%
+  mutate(total_benef_munic = sum(qt_beneficiario_ativo)) %>%
+  group_by(cd_municipio, year, cd_operadora) %>%
+  summarize(
+    insurer_benef = sum(qt_beneficiario_ativo),
+    total_benef = first(total_benef_munic),
+    market_share = insurer_benef / total_benef
+  ) %>%
+  mutate(
+    treatment_status = case_when(
+      cd_municipio %in% treated_munics ~ "Treated",
+      cd_municipio %in% control_munics ~ "Control",
+      TRUE ~ "Out of Sample"
+    ),
+    insurer = case_when(
+      cd_operadora == "368253" ~ "Hapvida",
+      cd_operadora == "359017" ~ "GNDI",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  collect()  # brings only the summarized results into memory
+
+# =============================================================================
+# Continue with Further Analysis or Export
+# =============================================================================
+# Now that you have a summary in 'market_shares', you can continue with further analyses.
+# For example, you might write out summary tables or use arrow's dplyr interface
+# to perform additional grouped calculations—all without loading the full raw dataset.
+
+cat("Processing complete. Data is queried lazily using Arrow, so only summaries are loaded into memory.\n")
