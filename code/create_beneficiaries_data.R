@@ -70,5 +70,5 @@ full_panel %>% glimpse()
 # ── 5. Write out to a single Parquet file ─────────────────────────────────
 arrow::write_parquet(
   full_panel,
-  here("data","processed_data","beneficiarios_filtered_2015_2024.parquet")
+  here("data","processed_data","national","beneficiarios_filtered_2015_2024.parquet")
 )

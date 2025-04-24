@@ -1,5 +1,3 @@
-# create_reajustes_panel.R
-
 # -------------------------------
 # 0. Load Libraries & Setup Paths
 # -------------------------------
@@ -153,27 +151,11 @@ message("Step 5: Selecting final columns and saving panel...")
 # Or just select the key ones needed downstream
 final_panel <- reajustes_cleaned %>% 
   select(
-    # Identifiers
-    id_contrato, id_plano, cd_operadora, cd_plano, year,
-    # Key Values
-    dt_inic_aplicacao, 
-    benef_comunicado = benef_comunicado_final, # Rename standardized back
-    percentual = percentual_final,             # Rename standardized back
-    # Flags (keep original names as they are standard now)
-    lg_retificacao, lg_negociacao, lg_parcelado, cd_agrupamento,
-    # Other potentially useful columns (add any others needed from 'all_reajustes_raw')
-    any_of(c("dt_fim_aplicacao", "dt_protocolo", "nm_protocolo", "sg_uf_contrato_reaj", "dt_carga", "dt_atualizacao"))
-  )
-
-final_panel <- final_panel %>%
-  select('id_contrato',
-         'id_plano',
-         'cd_operadora',
-         'year',
-         'benef_comunicado',
-         'percentual',
-         'lg_retificacao',
-         'sg_uf_contrato_reaj')
+    id_contrato, id_plano, cd_operadora, year,
+    benef_comunicado = benef_comunicado_final,
+    percentual = percentual_final,
+    lg_retificacao,sg_uf_contrato_reaj
+    )
 
 # Save the final panel
 write_parquet(final_panel, output_file)

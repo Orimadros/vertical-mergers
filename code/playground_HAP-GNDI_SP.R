@@ -39,14 +39,14 @@ operadoras <- read_csv2(here('data',
          uf)
 
 caracteristicas_planos <- read_csv2(here('data', 
-                             'raw_data',
-                             'ANS',
-                             'operadoras',
-                             'planos',
-                             'caracteristicas_produtos_saude_suplementar.csv')) %>%
+                                         'raw_data',
+                                         'ANS',
+                                         'operadoras',
+                                         'planos',
+                                         'caracteristicas_produtos_saude_suplementar.csv')) %>%
   clean_names()  %>%
   filter(contratacao == 'Coletivo empresarial',
-         sgmt_assistencial != 'Odontológico') %>%
+         str_detect(str_to_lower(sgmt_assistencial), 'hospitalar')) %>%
   rename(cd_operadora = 'registro_operadora')
 
 # Identify duplicate `cd_plano` - `cd_operadora` pairs
@@ -168,11 +168,11 @@ reajustes <- reajustes %>%
          is.na(lg_negociacao) | lg_negociacao != 1,
          lg_parcelado != 1,
          id_plano %in% relevant_plans
-         ) %>%
+  ) %>%
   mutate(percentual = as.numeric(gsub(",", ".", percentual)))
 
 
-  
+
 
 # O cd_agrupamento == 0 tira planos empresariais com menos de 30 vidas, cujos 
 # reajustes são negociados de forma agrupada por operadora.
@@ -191,8 +191,8 @@ pib_municipios %>%
   mutate(id_municipio = substring(as.character(id_municipio), 1, 6)) %>% 
   filter(ano == 2020) %>%
   select(id_municipio, pib)
-  
-  
+
+
 
 # -------------------------------
 # DATABASE COMPARISON
@@ -1508,7 +1508,7 @@ for (yr in years) {
   
   if (length(year_chunk_files) > 0) {
     year_dataset <- open_dataset(year_chunk_files)
-
+    
     # Define final output DIRECTORY path, using Hive-style partitioning
     output_dir_year <- here("data", "processed_data", "national", "beneficiaries_yearly") # Base directory
     output_partition_dir <- file.path(output_dir_year, paste0("year=", yr)) # Subdirectory like year=2015
@@ -2056,686 +2056,450 @@ if (exists("municipality_panel_with_chars") && nrow(municipality_panel_with_char
 # NATIONAL ESTIMATION
 # -------------------------------
 
+# national_analysis.R
+
 # -------------------------------
-# Load Global Data (e.g., Plan Characteristics)
+# 0.  LIBRARIES & GLOBAL DIRS
 # -------------------------------
-message("Loading Plan Characteristics...")
-caracteristicas_planos <- read_csv2(here('data', 
-                                         'raw_data',
-                                         'ANS',
-                                         'operadoras',
-                                         'planos',
-                                         'caracteristicas_produtos_saude_suplementar.csv')) %>%
-  clean_names()  %>%
-  # Filter for relevant plan types BEFORE removing duplicates
+
+# Create all top–level output dirs
+dir.create(here("data","processed_data","national"),       showWarnings = FALSE, recursive = TRUE)
+dir.create(here("data","processed_data","national","temp"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("data","processed_data","national","beneficiaries_yearly"),
+           showWarnings = FALSE, recursive = TRUE)
+dir.create(here("data","processed_data","national","reajustes_filtered"),
+           showWarnings = FALSE, recursive = TRUE)
+dir.create(here("data","images","national"),               showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------------
+# 1.  LOAD PLAN CHARACTERISTICS
+# -------------------------------
+message("Loading plan characteristics…")
+caracteristicas_planos <- read_csv2(
+  here("data","raw_data","ANS","operadoras","planos",
+       "caracteristicas_produtos_saude_suplementar.csv"),
+  locale = locale(encoding="latin1")
+) %>%
+  clean_names() %>%
   filter(
-    str_to_lower(contratacao) %in% c("coletivo empresarial", "coletivo por adesão"),
-    !str_detect(str_to_lower(sgmt_assistencial), "odontol[óo]gico")
+    str_to_lower(contratacao) %in% c("coletivo empresarial","coletivo por adesão"),
+    !str_detect(str_to_lower(sgmt_assistencial),"odontol[óo]gico")
   ) %>%
-  rename(cd_operadora = 'registro_operadora') %>%
-  # Ensure cd_operadora is character
+  rename(cd_operadora = registro_operadora) %>%
   mutate(cd_operadora = as.character(cd_operadora)) %>%
-  # Remove duplicates, keeping the latest entry per plan-operator
   group_by(cd_plano, cd_operadora) %>%
   slice_max(dt_situacao, with_ties = FALSE) %>%
   ungroup()
 
 # -------------------------------
-# STEP 1: PROCESS BENEFICIARIES DATA (NATIONAL)
+# 2.  PROCESS BENEFICIARY FILES
 # -------------------------------
-message("Starting Step 1: Processing National Beneficiary Data...")
-
+message("Step 2: Process beneficiaries data (2015–2024)…")
 years <- 2015:2024
 
-# Prepare output directories
-dir.create(here("data", "processed_data", "national"), showWarnings = FALSE, recursive = TRUE)
-dir.create(here("data", "processed_data", "national", "temp"), showWarnings = FALSE, recursive = TRUE)
-dir.create(here("data", "processed_data", "national", "beneficiaries_yearly"), showWarnings = FALSE, recursive = TRUE)
-
-
-# Loop through each year
 for (yr in years) {
-  year_dir <- here("data", "raw_data", "ANS", "beneficiarios", as.character(yr))
-  message("Processing year: ", yr, " in directory: ", year_dir)
-  
-  # Find all state beneficiary files for the year
-  # Pattern: pda-024-icb-XX-YYYY_12.csv (where XX is state code)
+  message("→ Year ", yr)
+  year_dir <- here("data","raw_data","ANS","beneficiarios", as.character(yr))
   state_files <- list.files(
-    year_dir,
-    pattern = paste0("pda-024-icb-.*-", yr, "_12\\.csv$"),
-    full.names = TRUE
+    path        = year_dir,
+    pattern     = paste0("pda-024-icb-.*-",yr,"_12\\.csv$"),
+    full.names  = TRUE
   )
-  
-  if (length(state_files) == 0) {
-    warning("No beneficiary files found for year ", yr, " in ", year_dir, ". Skipping.")
-    next
+  if (length(state_files)==0) {
+    warning("  No files for ", yr); next
   }
   
-  # Create a temp directory for this year's chunks
-  year_temp_dir <- here("data", "processed_data", "national", "temp", as.character(yr))
+  # create year‑specific temp
+  year_temp_dir <- here("data","processed_data","national","temp",as.character(yr))
   dir.create(year_temp_dir, showWarnings = FALSE, recursive = TRUE)
   
-  # Process each state file within the year
-  chunk_counter <- 1 # Reset chunk counter for the year
+  # process each state file in chunks
   for (file_path in state_files) {
-    message("  Processing file: ", basename(file_path))
-    
-    # Define callback function for chunked processing
-    chunk_callback <- DataFrameCallback$new(function(chunk, pos) {
-      
-      # Check if essential columns exist before processing
-      required_benef_cols <- c("id_cmpt_movel", "#id_cmpt_movel", "number_id_cmpt_movel", 
-                               "cd_operadora", "cd_plano", "de_contratacao_plano", 
-                               "de_segmentacao_plano", "qt_beneficiario_ativo")
-      if (!any(c("id_cmpt_movel", "#id_cmpt_movel", "number_id_cmpt_movel") %in% names(chunk))) {
-        warning("Skipping chunk ", pos, " in file ", basename(file_path), ": Missing id_cmpt_movel column.")
-        return(data.frame())
-      }
-      # Add checks for other absolutely critical columns if necessary...
-      
-      processed_chunk <- chunk %>%
+    message("   • processing ", basename(file_path))
+    cb <- DataFrameCallback$new(function(chunk, pos) {
+      df <- chunk %>%
         clean_names() %>%
-        rename(id_cmpt_movel = any_of(c("id_cmpt_movel", "#id_cmpt_movel", "number_id_cmpt_movel"))) %>%
-        # Add required columns with NA if they don't exist after clean_names
-        mutate(
-          dt_carga = if ("dt_carga" %in% names(.)) as.character(dt_carga) else NA_character_,
-          de_contratacao_plano = if ("de_contratacao_plano" %in% names(.)) de_contratacao_plano else NA_character_,
-          de_segmentacao_plano = if ("de_segmentacao_plano" %in% names(.)) de_segmentacao_plano else NA_character_,
-          cd_plano = if ("cd_plano" %in% names(.)) as.character(cd_plano) else NA_character_,
-          qt_beneficiario_ativo = if ("qt_beneficiario_ativo" %in% names(.)) qt_beneficiario_ativo else NA_integer_
-        ) %>%
+        rename(id_cmpt_movel = any_of(c("id_cmpt_movel","#id_cmpt_movel","number_id_cmpt_movel"))) %>%
+        mutate(id_cmpt_movel = as.character(id_cmpt_movel)) %>%
         mutate(
           id_cmpt_movel = case_when(
-            str_detect(as.character(id_cmpt_movel), "-") ~ as.character(id_cmpt_movel),
-            TRUE ~ paste0(substr(as.character(id_cmpt_movel), 1, 4), "-", substr(as.character(id_cmpt_movel), 5, 6))
+            str_detect(id_cmpt_movel, "-") ~ id_cmpt_movel,
+            TRUE ~ paste0(substr(id_cmpt_movel,1,4), "-", substr(id_cmpt_movel,5,6))
           ),
-          cd_operadora = as.character(cd_operadora), # Ensure character type for join
-          year = yr
+          dt_carga     = as.character(dt_carga),
+          cd_operadora = as.character(cd_operadora),
+          year         = yr
         ) %>%
-        # Apply filters *after* ensuring columns exist
         filter(
-          str_to_lower(de_contratacao_plano) %in% c("coletivo empresarial", "coletivo por adesão"),
-          !str_detect(str_to_lower(de_segmentacao_plano), "odontol[óo]gico")
+          str_to_lower(de_contratacao_plano) %in% c("coletivo empresarial","coletivo por adesão"),
+          !str_detect(str_to_lower(de_segmentacao_plano),"odontol[óo]gico")
         ) %>%
-        # Join requires cd_plano which should exist in beneficiaries files
         left_join(
-          caracteristicas_planos %>% select(cd_plano, cd_operadora, id_plano),
-          by = c("cd_plano", "cd_operadora") # Join by both plan code and operator code
+          caracteristicas_planos %>% select(cd_plano,cd_operadora,id_plano),
+          by = c("cd_plano","cd_operadora")
         ) %>%
-        # Select desired columns, using any_of for robustness
-        select( 
-          any_of(c("id_cmpt_movel", "cd_operadora", "nm_razao_social", "nr_cnpj", 
-                   "modalidade_operadora", "sg_uf", "cd_municipio", "tp_sexo", 
-                   "de_faixa_etaria", "de_faixa_etaria_reaj", "cd_plano", 
-                   "de_contratacao_plano", "de_abrg_geografica_plano", 
-                   "qt_beneficiario_ativo", "dt_carga", "id_plano", "year"))
+        select(
+          id_cmpt_movel, cd_operadora, nm_razao_social, nr_cnpj,
+          modalidade_operadora, sg_uf, cd_municipio, tp_sexo,
+          de_faixa_etaria, de_faixa_etaria_reaj, cd_plano,
+          de_contratacao_plano, de_abrg_geografica_plano,
+          qt_beneficiario_ativo, dt_carga, id_plano, year
         )
       
-      # Write to individual chunk file if data exists
-      if(nrow(processed_chunk) > 0) {
-        chunk_file <- file.path(year_temp_dir, paste0("chunk_", sprintf("%05d", chunk_counter), ".parquet"))
-        write_parquet(processed_chunk, chunk_file)
-        chunk_counter <<- chunk_counter + 1 # Increment global chunk counter for the year
+      if (nrow(df)>0) {
+        fn <- file.path(year_temp_dir, paste0("chunk_",sprintf("%05d",pos),".parquet"))
+        write_parquet(df, fn)
       }
-      
-      return(data.frame())  # Return empty dataframe to save memory
+      return(data.frame())
     })
     
-    # Process file in chunks
-    tryCatch({
-      read_csv2_chunked(
-        file = file_path,
-        callback = chunk_callback,
-        chunk_size = 100000, # Adjust based on RAM
-        locale = locale(encoding = "latin1")
-      )
-    }, error = function(e) {
-      warning("Error processing file ", basename(file_path), " for year ", yr, ": ", e$message)
-    })
-  } # End loop over state files for the year
-  
-  # Combine chunks for the year into a single file
-  message("Combining chunks for year ", yr)
-  
-  year_chunk_files <- list.files(year_temp_dir, pattern = "\\.parquet$", full.names = TRUE)
-  
-  if (length(year_chunk_files) > 0) {
-    year_dataset <- open_dataset(year_chunk_files)
-    # Define final output file path
-    output_file <- here("data", "processed_data", "national", "beneficiaries_yearly", paste0("beneficiarios_", yr, ".parquet"))
-    
-    # Check if output file already exists and remove it if necessary
-    if (file.exists(output_file)) {
-      warning("Overwriting existing file: ", output_file)
-      file.remove(output_file)
-    }
-    
-    # Write the combined data as a single parquet file
-    write_parquet(collect(year_dataset), output_file) # Use collect() before write_parquet for single file output
-    
-  } else {
-    warning("No chunks found or processed successfully to combine for year ", yr)
+    read_csv2_chunked(
+      file      = file_path,
+      callback  = cb,
+      chunk_size= 100000,
+      locale    = locale(encoding="latin1")
+    )
   }
   
-  # Clean up temp directory for the year
-  unlink(year_temp_dir, recursive = TRUE)
-  
-  message("Completed processing for year: ", yr)
-  gc()  # Force garbage collection
+  # now combine & write as partitioned dataset
+  message("  Combining & writing partition for ",yr)
+  parts <- list.files(year_temp_dir,pattern="\\.parquet$",full.names=TRUE)
+  if (length(parts)>0) {
+    ds <- open_dataset(parts)
+    write_dataset(
+      dataset      = ds,
+      path         = here("data","processed_data","national","beneficiaries_yearly"),
+      format       = "parquet",
+      partitioning = "year"
+    )
+  } else {
+    warning("   no chunks to combine for ",yr)
+  }
+  unlink(year_temp_dir, recursive=TRUE)
+  gc()
 }
-# Clean up main temp directory
-unlink(here("data", "processed_data", "national", "temp"), recursive = TRUE)
+
+unlink(here("data","processed_data","national","temp"),recursive=TRUE)
+
 
 # -------------------------------
-# STEP 2: IDENTIFY TREATMENT GROUPS (NATIONAL)
+# 3.  IDENTIFY TREATMENT GROUPS
 # -------------------------------
-message("Starting Step 2: Identifying National Treatment Groups...")
-
-# List the yearly processed beneficiary parquet files
-processed_files_dir <- here("data", "processed_data", "national", "beneficiaries_yearly")
-beneficiary_files <- list.files(
-  processed_files_dir, 
-  pattern = "beneficiarios_.*\\.parquet$", 
-  full.names = TRUE
+message("Step 3: Identify treatment groups…")
+ds <- open_dataset(
+  here("data","processed_data","national","beneficiaries_yearly"),
+  partitioning = "year"
 )
-
-if (length(beneficiary_files) == 0) {
-  stop("No yearly beneficiary parquet files found in ", processed_files_dir)
-}
-
-# Open the files as an Arrow dataset
-ds <- open_dataset(beneficiary_files)
-
-# Calculate baseline (2020) market shares for ALL municipalities
-message("  Calculating baseline (2020) totals...")
-baseline_market_shares <- ds %>%
-  filter(year == 2020) %>%
+baseline <- ds %>%
+  filter(year==2020) %>%
   group_by(cd_municipio) %>%
-  summarize(total_benef_munic = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+  summarise(total_benef = sum(qt_beneficiario_ativo,na.rm=TRUE)) %>%
   collect()
 
-# Calculate insurer-level presence by municipality
-message("  Calculating baseline (2020) insurer presence...")
-insurer_presence <- ds %>%
-  filter(year == 2020) %>%
-  group_by(cd_municipio, cd_operadora) %>%
-  summarize(insurer_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+ins_pres <- ds %>%
+  filter(year==2020) %>%
+  group_by(cd_municipio,cd_operadora) %>%
+  summarise(insurer_benef = sum(qt_beneficiario_ativo,na.rm=TRUE)) %>%
   collect() %>%
-  left_join(baseline_market_shares, by = "cd_municipio") %>%
+  left_join(baseline, by="cd_municipio") %>%
   mutate(
-    market_share = ifelse(total_benef_munic > 0, insurer_benef / total_benef_munic, 0),
-    insurer_type = case_when(
-      cd_operadora == "368253" ~ "Hapvida",
-      cd_operadora == "359017" ~ "GNDI",
-      TRUE ~ "Other"
+    market_share  = ifelse(total_benef>0, insurer_benef/total_benef, 0),
+    insurer_type  = case_when(
+      cd_operadora=="368253" ~ "Hapvida",
+      cd_operadora=="359017" ~ "GNDI",
+      TRUE                  ~ "Other"
     ),
-    has_presence = insurer_benef >= 50
+    has_presence  = insurer_benef>=50
   )
 
-# Identify municipalities with significant presence of each insurer
-message("  Classifying municipalities...")
-municipality_treatment <- insurer_presence %>%
-  filter(insurer_type %in% c("Hapvida", "GNDI")) %>%
-  select(cd_municipio, insurer_type, has_presence) %>%
+municipality_treatment <- ins_pres %>%
+  filter(insurer_type %in% c("Hapvida","GNDI")) %>%
+  select(cd_municipio,insurer_type,has_presence) %>%
   pivot_wider(
-    id_cols = cd_municipio,
-    names_from = insurer_type,
+    id_cols     = cd_municipio,
+    names_from  = insurer_type,
     values_from = has_presence,
     values_fill = FALSE
   ) %>%
-  # Ensure both Hapvida and GNDI columns exist
-  { if (!"Hapvida" %in% names(.)) mutate(., Hapvida = FALSE) else . } %>%
-  { if (!"GNDI" %in% names(.)) mutate(., GNDI = FALSE) else . } %>%
   mutate(
+    Hapvida = coalesce(Hapvida,FALSE),
+    GNDI    = coalesce(GNDI,   FALSE),
     treatment_status = case_when(
-      # Removed SP capital exclusion: cd_municipio == 355030 ~ "Out of Sample", 
       Hapvida & GNDI ~ "Treated",
-      Hapvida | GNDI ~ "Control", 
-      TRUE ~ "Out of Sample"
+      Hapvida | GNDI ~ "Control",
+      TRUE           ~ "Out of Sample"
     ),
-    treated = case_when(
-      treatment_status == "Treated" ~ 1,
-      treatment_status == "Control" ~ 0,
-      TRUE ~ NA_real_
-    )
+    treated = as.numeric(treatment_status=="Treated")
   )
 
-# Save treatment assignments
-output_treatment_file <- here("data", "processed_data", "national", "municipality_treatment.parquet")
-write_parquet(municipality_treatment, output_treatment_file)
-message("  Treatment assignments saved to: ", output_treatment_file)
+write_parquet(
+  municipality_treatment,
+  here("data","processed_data","national","municipality_treatment.parquet")
+)
+
 
 # -------------------------------
-# STEP 3: CALCULATE PLAN MARKET SHARES (NATIONAL)
+# 4.  PLAN MARKET SHARES
 # -------------------------------
-message("Starting Step 3: Calculating National Plan Market Shares...")
-
-# Calculate municipality-level beneficiary totals by year
-message("  Calculating yearly municipality totals...")
-municipality_year_totals <- ds %>%
-  group_by(cd_municipio, year) %>%
-  summarize(total_benef_munic = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+message("Step 4: Compute plan market shares…")
+by_mun_year <- ds %>%
+  group_by(cd_municipio,year) %>%
+  summarise(total_benef = sum(qt_beneficiario_ativo,na.rm=TRUE)) %>%
   collect()
 
-# Calculate plan-level shares by municipality-year
-message("  Calculating yearly plan shares...")
 plan_market_shares <- ds %>%
-  filter(!is.na(id_plano)) %>% 
-  group_by(cd_municipio, year, id_plano, cd_operadora) %>%
-  summarize(plan_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+  filter(!is.na(id_plano)) %>%
+  group_by(cd_municipio,year,id_plano,cd_operadora) %>%
+  summarise(plan_benef = sum(qt_beneficiario_ativo,na.rm=TRUE)) %>%
   collect() %>%
-  left_join(municipality_year_totals, by = c("cd_municipio", "year")) %>%
+  left_join(by_mun_year, by=c("cd_municipio","year")) %>%
   mutate(
-    market_share = ifelse(total_benef_munic > 0, plan_benef / total_benef_munic, 0),
-    insurer = case_when(
-      cd_operadora == "368253" ~ "Hapvida",
-      cd_operadora == "359017" ~ "GNDI",
-      TRUE ~ "Other"
+    market_share = ifelse(total_benef>0, plan_benef/total_benef, 0),
+    insurer      = case_when(
+      cd_operadora=="368253" ~ "Hapvida",
+      cd_operadora=="359017" ~ "GNDI",
+      TRUE                   ~ "Other"
     ),
-    merged_insurer = case_when(
-      year >= 2021 & insurer %in% c("Hapvida", "GNDI") ~ "HAP-GNDI-merged",
-      TRUE ~ insurer
-    )
+    merged_insurer = ifelse(year>=2021 & insurer %in% c("Hapvida","GNDI"),
+                            "HAP‑GNDI‑merged", insurer)
   ) %>%
-  # Join with treatment status
   left_join(
-    select(municipality_treatment, cd_municipio, treatment_status, treated),
+    municipality_treatment %>% select(cd_municipio,treatment_status,treated),
     by = "cd_municipio"
   )
 
-# Save to parquet for later use
-output_plan_shares_file <- here("data", "processed_data", "national", "plan_market_shares.parquet")
-write_parquet(plan_market_shares, output_plan_shares_file)
-message("  Plan market shares saved to: ", output_plan_shares_file)
+write_parquet(
+  plan_market_shares,
+  here("data","processed_data","national","plan_market_shares.parquet")
+)
 
 # -------------------------------
-# STEP 4: PROCESS READJUSTMENT DATA (NATIONAL)
+# 5.  READJUSTMENT DATA
 # -------------------------------
-message("Starting Step 4: Processing National Readjustment Data...")
+message("Step 5: Process readjustments…")
+reaj_dir  <- here("data","raw_data","ANS","operadoras","reajustes","reajustes_parquet")
+r_files   <- list.files(reaj_dir, pattern="\\.parquet$", full.names=TRUE)
 
-# Define the merger date
-merger_date <- as.Date('2022-02-11')
+# 5a) Compute the full union of *all* column names (cleaned) across every file:
+all_unique_cols <- sort(unique(unlist(lapply(r_files, function(path) {
+  tbl <- read_parquet(path, as_data_frame = FALSE)
+  clean_names(as.data.frame(tbl)[0, ]) %>% names()
+}))))
 
-# Path to readjustment parquet files
-reajustes_dir <- here("data", "raw_data", "ANS", "operadoras", "reajustes", "reajustes_parquet")
-temp_dir <- here("data", "processed_data", "national", "temp", "reajustes")
-dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+temp_r    <- here("data","processed_data","national","temp","reajustes")
+dir.create(temp_r, recursive=TRUE, showWarnings=FALSE)
 
-# Get all parquet files
-reajustes_files <- list.files(reajustes_dir, pattern = "\\.parquet$", full.names = TRUE) 
+chunk_out <- vector()
+n_files <- length(r_files)
 
-# Process each file separately
-processed_chunk_files <- c() # To keep track of created files
-for (i in seq_along(reajustes_files)) {
-  file_path <- reajustes_files[i]
-  message("  Processing file ", i, " of ", length(reajustes_files), ": ", basename(file_path))
+for (i in seq_along(r_files)) {
+  path <- r_files[i]
+  message(sprintf("Processing file %3d of %3d: %s", i, n_files, basename(path)))
   
-  reajustes_chunk <- tryCatch({
-    read_parquet(file_path) %>% clean_names()
-  }, error = function(e) {
-    warning("Could not read or clean file: ", basename(file_path), " | Error: ", e$message)
-    return(NULL)
-  })
-  
-  if (is.null(reajustes_chunk)) next 
-  
-  # Dynamically handle column name variations and add missing essential columns
-  # (Using the robust handling from previous correction)
-  # --- Dynamically handle column name variations ---
-  # 1. Standardize 'benef_comunicado'
-  if ("qt_benef_comunicado" %in% names(reajustes_chunk)) {
-    reajustes_chunk <- reajustes_chunk %>% rename(benef_comunicado_std = qt_benef_comunicado)
-  } else if ("benef_comunicado" %in% names(reajustes_chunk)) {
-    reajustes_chunk <- reajustes_chunk %>% rename(benef_comunicado_std = benef_comunicado)
-  } else {
-    reajustes_chunk <- reajustes_chunk %>% mutate(benef_comunicado_std = NA_integer_)
-  }
-  
-  # 2. Standardize 'percentual'
-  if ("pc_percentual" %in% names(reajustes_chunk)) {
-    reajustes_chunk <- reajustes_chunk %>% rename(percentual_std = pc_percentual)
-  } else if ("percentual" %in% names(reajustes_chunk)) {
-    reajustes_chunk <- reajustes_chunk %>% rename(percentual_std = percentual)
-  } else {
-    reajustes_chunk <- reajustes_chunk %>% mutate(percentual_std = NA_character_) # Keep as char for gsub
-  }
-  
-  # 3. Add other necessary columns if missing
-  required_cols <- list(
-    lg_retificacao = NA, lg_negociacao = NA, lg_parcelado = NA, cd_agrupamento = NA, 
-    id_contrato = NA_character_, id_plano = NA_character_, cd_operadora = NA_character_, 
-    dt_inic_aplicacao = as.Date(NA)
-  )
-  for(col_name in names(required_cols)){
-    if (!col_name %in% names(reajustes_chunk)) {
-      reajustes_chunk[[col_name]] <- required_cols[[col_name]]
+  df <- tryCatch(
+    read_parquet(path) %>% clean_names(),
+    error = function(e) {
+      message("  ↳ failed to read, skipping: ", basename(path))
+      NULL
     }
+  )
+  if (is.null(df)) next
+  
+  # 5b) Ensure every column in all_unique_cols exists:
+  missing <- setdiff(all_unique_cols, names(df))
+  for (col in missing) df[[col]] <- NA
+  
+  # 5c) Explicitly rename or create the two “std” columns:
+  if ("benef_comunicado" %in% names(df)) {
+    df <- rename(df, benef_comunicado_std = benef_comunicado)
+  } else if ("qt_benef_comunicado" %in% names(df)) {
+    df <- rename(df, benef_comunicado_std = qt_benef_comunicado)
+  } else {
+    df$benef_comunicado_std <- NA_integer_
   }
-  # --- End of dynamic handling ---
   
-  # Continue processing using the standardized names
-  reajustes_processed <- reajustes_chunk %>%
+  if ("percentual" %in% names(df)) {
+    df <- rename(df, percentual_std = percentual)
+  } else if ("pc_percentual" %in% names(df)) {
+    df <- rename(df, percentual_std = pc_percentual)
+  } else {
+    df$percentual_std <- NA_real_
+  }
+  
+  # 5d) Type‑casts, coalesces & filters:
+  df <- df %>%
     mutate(
-      dt_inic_aplicacao = as.Date(dt_inic_aplicacao), 
-      percentual_numeric = suppressWarnings(as.numeric(gsub(",", ".", percentual_std))), 
-      year = year(dt_inic_aplicacao)
+      benef_comunicado = as.integer(benef_comunicado_std),
+      percentual       = as.numeric(gsub(",", ".", percentual_std)),
+      year             = year(dt_inic_aplicacao),
+      lg_retificacao   = coalesce(lg_retificacao,   NA_integer_),
+      lg_negociacao    = coalesce(lg_negociacao,    NA_integer_),
+      lg_parcelado     = coalesce(lg_parcelado,     NA_integer_),
+      cd_agrupamento   = coalesce(cd_agrupamento,   NA_integer_)
     ) %>%
-    # Filter based on national criteria (no SP filter)
     filter(
-      cd_agrupamento == 0 | is.na(cd_agrupamento), 
+      (cd_agrupamento == 0 | is.na(cd_agrupamento)),
       is.na(lg_negociacao) | lg_negociacao != 1,
-      is.na(lg_parcelado) | lg_parcelado != 1,
-      !is.na(id_plano), 
-      !is.na(year) 
+      is.na(lg_parcelado)  | lg_parcelado  != 1,
+      !is.na(id_plano)
     ) %>%
-    # Select standardized and other necessary columns, renaming back
-    select(
-      any_of(c("id_contrato", "id_plano", "cd_operadora", "dt_inic_aplicacao")), # Use any_of for robustness
-      benef_comunicado = benef_comunicado_std,
-      percentual = percentual_numeric,
-      year,
-      lg_retificacao
-    )
-  
-  # Handle corrections and multiple readjustments
-  reajustes_cleaned <- reajustes_processed %>%
     group_by(id_contrato, id_plano, year) %>%
     filter(
-      if (any(lg_retificacao == 1, na.rm = TRUE)) {
-        lg_retificacao == 1 | is.na(lg_retificacao) 
-      } else { TRUE }
+      if (any(lg_retificacao == 1, na.rm = TRUE))
+        lg_retificacao == 1 | is.na(lg_retificacao)
+      else
+        TRUE
     ) %>%
-    filter(n() == 1) %>% 
+    filter(n() == 1) %>%
     ungroup()
   
-  # Write to temp file
-  if (nrow(reajustes_cleaned) > 0) { 
-    chunk_output <- file.path(temp_dir, paste0("reajustes_chunk_", sprintf("%03d", i), ".parquet"))
-    write_parquet(reajustes_cleaned, chunk_output)
-    processed_chunk_files <- c(processed_chunk_files, chunk_output) 
-  } 
-  
-  # Clean up
-  rm(reajustes_chunk, reajustes_processed, reajustes_cleaned)
-  gc()
-}
-
-# Combine all processed readjustment chunks
-message("  Combining readjustment chunks...")
-if (length(processed_chunk_files) > 0) {
-  reajustes_ds <- open_dataset(processed_chunk_files)
-  output_filtered_dir <- here("data", "processed_data", "national", "reajustes_filtered") 
-  if (dir.exists(output_filtered_dir)) unlink(output_filtered_dir, recursive = TRUE) 
-  write_dataset(reajustes_ds, output_filtered_dir)
-  message("  Combined filtered readjustments written to: ", output_filtered_dir)
-} else {
-  warning("No readjustment chunks found or created to combine.")
-}
-unlink(temp_dir, recursive = TRUE) # Clean up temp directory
-
-# Calculate plan-level averages 
-message("  Calculating plan-level readjustment averages...")
-output_filtered_dir <- here("data", "processed_data", "national", "reajustes_filtered") 
-
-if (dir.exists(output_filtered_dir)) {
-  plan_reajustes_data_for_avg <- open_dataset(output_filtered_dir) %>%
-    select(id_plano, year, percentual, benef_comunicado) %>%
-    filter(!is.na(id_plano) & !is.na(year) & !is.na(percentual) & !is.na(benef_comunicado) & benef_comunicado > 0) %>%
-    collect() 
-  
-  plan_reajustes_avg <- plan_reajustes_data_for_avg %>%
-    group_by(id_plano, year) %>%
-    summarize(
-      percentual_avg = weighted.mean(percentual, w = benef_comunicado, na.rm = TRUE),
-      total_benef = sum(benef_comunicado, na.rm = TRUE),
-      n_contracts = n(),
-      .groups = "drop" 
-    )
-  
-  output_avg_file <- here("data", "processed_data", "national", "plan_reajustes_avg.parquet")
-  write_parquet(plan_reajustes_avg, output_avg_file)
-  message("  Plan readjustment averages saved to: ", output_avg_file)
-  
-  rm(plan_reajustes_data_for_avg)
-  gc()
-  
-} else {
-  warning("Filtered readjustment dataset directory not found. Skipping average calculation.")
-  plan_reajustes_avg <- data.frame() 
-}
-
-# -------------------------------
-# STEP 5: CREATE MUNICIPALITY PANEL (NATIONAL)
-# -------------------------------
-message("Starting Step 5: Creating National Municipality Panel...")
-
-if (exists("plan_reajustes_avg") && exists("plan_market_shares") && nrow(plan_reajustes_avg) > 0 && nrow(plan_market_shares) > 0) {
-  municipality_panel <- plan_market_shares %>%
-    mutate(id_plano = as.character(id_plano)) %>%
-    left_join(
-      plan_reajustes_avg %>% 
-        mutate(id_plano = as.character(id_plano)) %>%
-        select(id_plano, year, percentual_avg),
-      by = c("id_plano", "year")
-    ) %>%
-    group_by(cd_municipio, year) %>%
-    summarize(
-      readjustment = if (sum(!is.na(percentual_avg) & !is.na(market_share) & market_share > 0) > 0) {
-        weighted.mean(percentual_avg, w = market_share, na.rm = TRUE)
-      } else { NA_real_ },
-      n_plans = n(),
-      n_plans_with_readj = sum(!is.na(percentual_avg)),
-      total_market_share = sum(market_share, na.rm = TRUE),
-      coverage = sum(market_share[!is.na(percentual_avg)], na.rm = TRUE),
-      treatment_status = first(treatment_status),
-      treated = first(treated),
-      .groups = "drop"
-    ) %>%
-    # Removed filter for SP capital: filter(cd_municipio != 355030) %>%
-    mutate(
-      merger_year = 2022,
-      event_time = year - merger_year,
-      post = year >= merger_year
-    )
-} else {
-  warning("Input data for municipality panel (plan shares or avg readjustments) is missing or empty. Skipping panel creation.")
-  municipality_panel <- data.frame() 
-}
-
-# -------------------------------
-# STEP 6: ADD MUNICIPALITY CHARACTERISTICS (NATIONAL)
-# -------------------------------
-message("Starting Step 6: Adding National Municipality Characteristics...")
-
-if (exists("municipality_panel") && nrow(municipality_panel) > 0) {
-  # Load national municipality GDP data
-  pib_municipios <- read_csv(here('data', 'raw_data', 'municipios', 'br_ibge_pib_municipio.csv')) %>%
-    filter(ano == 2020) %>%
-    mutate(
-      id_municipio_char = substring(as.character(id_municipio), 1, 6),
-      cd_municipio = as.numeric(id_municipio_char) 
-    ) %>%
-    filter(!is.na(cd_municipio)) %>% # Remove rows where conversion failed
-    select(cd_municipio, pib) 
-  
-  municipality_panel_with_chars <- municipality_panel %>%
-    mutate(cd_municipio = as.numeric(cd_municipio)) %>% 
-    left_join(pib_municipios, by = "cd_municipio") %>%
-    rename(
-      municipality_code = cd_municipio,
-      readjustment_rate = readjustment,
-      total_plans = n_plans,
-      plans_with_readjustment = n_plans_with_readj,
-      market_share_coverage = coverage,
-      municipality_gdp = pib
-    )
-} else {
-  warning("Municipality panel is empty. Skipping adding characteristics.")
-  municipality_panel_with_chars <- data.frame()
-}
-
-# -------------------------------
-# STEP 7: CREATE BALANCED PANEL & EXPORT TO STATA (NATIONAL)
-# -------------------------------
-message("Starting Step 7: Creating Balanced Panel & Exporting National Data to Stata...")
-
-if (exists("municipality_panel_with_chars") && nrow(municipality_panel_with_chars) > 0) {
-  # Check panel balance
-  panel_check <- municipality_panel_with_chars %>%
-    filter(!is.na(municipality_code) & !is.na(year)) %>% 
-    group_by(municipality_code) %>%
-    summarize(
-      n_years = n_distinct(year),
-      min_year = min(year, na.rm=TRUE),
-      max_year = max(year, na.rm=TRUE),
-      is_balanced = n_years == length(unique(municipality_panel_with_chars$year)), 
-      .groups = "drop"
-    )
-  
-  print("Balance Summary:")
-  print(panel_check %>%
-          group_by(is_balanced) %>%
-          summarize(
-            n_municipalities = n(),
-            avg_years = mean(n_years)
-          ))
-  
-  # Export full (unbalanced) panel
-  output_dta_unbalanced <- here("data", "processed_data", "national", "municipality_panel_event_study_unbalanced.dta")
-  write_dta(municipality_panel_with_chars, output_dta_unbalanced)
-  message("  Unbalanced panel saved to: ", output_dta_unbalanced)
-  
-  # Create and export balanced panel
-  balanced_municipalities <- panel_check %>%
-    filter(is_balanced) %>%
-    pull(municipality_code)
-  
-  municipality_panel_balanced <- municipality_panel_with_chars %>%
-    filter(municipality_code %in% balanced_municipalities)
-  
-  output_dta_balanced <- here("data", "processed_data", "national", "municipality_panel_event_study_balanced.dta")
-  write_dta(municipality_panel_balanced, output_dta_balanced)
-  message("  Balanced panel saved to: ", output_dta_balanced)
-  
-} else {
-  warning("Final panel is empty. Skipping export to Stata.")
-}
-
-# -------------------------------
-# STEP 8: CREATE TREATMENT MAP (NATIONAL)
-# -------------------------------
-message("Starting Step 8: Creating National Treatment Map...")
-
-if (exists("municipality_treatment") && nrow(municipality_treatment) > 0) {
-  # Helper function
-  trim_last_char <- function(column) {
-    as.numeric(substr(as.character(column), 1, nchar(column) - 1))
+  if (nrow(df) > 0) {
+    out <- file.path(temp_r, sprintf("rchunk_%03d.parquet", i))
+    write_parquet(df, out)
+    chunk_out <- c(chunk_out, out)
+    message("  ↳ wrote chunk (", nrow(df), " rows)")
+  } else {
+    message("  ↳ no rows after filtering, skipping write")
   }
-  
-  # Read all Brazilian municipalities
-  br_municipalities <- read_municipality(code_muni = "all", year = 2020) %>%
-    mutate(code_muni = trim_last_char(code_muni))
-  
-  # Read state boundaries for better visualization
-  br_states <- read_state(year = 2020)
-  
-  # Prepare treatment data
-  map_data <- select(municipality_treatment, cd_municipio, treatment_status) %>%
-    mutate(cd_municipio = as.numeric(cd_municipio)) # Ensure numeric key for joining
-  
-  # Join with spatial data
-  br_municipalities_with_treatment <- br_municipalities %>%
-    left_join(map_data, by = c("code_muni" = "cd_municipio")) %>%
-    mutate(
-      # Set NA treatment_status (municipalities not in our treatment definition) to "Out of Sample"
-      treatment = ifelse(is.na(treatment_status), "Out of Sample", treatment_status)
-    )
-  
-  # Create map showing all of Brazil
-  treatment_map_br <- ggplot() +
-    # Base map layer for municipalities
-    geom_sf(data = br_municipalities_with_treatment, 
-            aes(fill = treatment), 
-            color = NA, # No municipality borders for clarity
-            size = 0.01) + 
-    # Add state boundaries on top
-    geom_sf(data = br_states,
-            fill = NA,
-            color = "white", # White state borders
-            size = 0.3) +
-    # Color scheme
-    scale_fill_manual(
-      values = c(
-        "Treated" = "orange",
-        "Control" = "darkcyan",
-        "Out of Sample" = "lightgrey" # All non-treated/control are light grey
-      ),
-      name = "Treatment Status",
-      limits = c("Treated", "Control", "Out of Sample"),
-      na.value = "grey80" # Color for any unexpected NAs
-    ) +
-    # Labels and title
-    labs(
-      title = "Treatment Status of Brazilian Municipalities", # Updated title
-      subtitle = "Based on Hapvida and GNDI Beneficiary Presence in 2020",
-      caption = paste(
-        "Data source: ANS & IBGE\n",
-        "Note: Municipalities classified as treated if both insurers have ≥50 beneficiaries."
-        # Removed SP capital exclusion note
-      )
-    ) +
-    # Theme customization
-    theme_void() + # Use theme_void for maps
-    theme(
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
-      plot.subtitle = element_text(size = 12, hjust = 0.5),
-      plot.caption = element_text(size = 8, hjust = 0),
-      legend.position = "bottom",
-      legend.title = element_text(size = 10),
-      legend.text = element_text(size = 9)
-    )
-  
-  # Save map
-  dir.create(here("data", "images", "national"), showWarnings = FALSE, recursive = TRUE)
-  output_map_file <- here("data", "images", "national", "treatment_status_map_BR.png")
-  ggsave(
-    output_map_file,
-    treatment_map_br,
-    width = 8, 
-    height = 8,
-    dpi = 300
+}
+
+
+if (length(chunk_out) > 0) {
+  message("Combining filtered reajuste chunks…")
+  dsr <- open_dataset(chunk_out) 
+  write_dataset(
+    dataset      = dsr,
+    path         = here("data","processed_data","national","reajustes_filtered"),
+    format       = "parquet"
   )
-  message("  National treatment map saved to: ", output_map_file)
+  message("Filtered reajustes written to data/processed_data/national/reajustes_filtered")
   
+  # now it’s safe to delete the temp files:
+  unlink(temp_r, recursive = TRUE)
+  message("Cleaned up temp directory")
 } else {
-  warning("municipality_treatment data not available. Skipping map creation.")
+  message("No filtered chunks to combine — temp directory retained for inspection")
 }
 
 
+
+
 # -------------------------------
-# STEP 9: PRINT SUMMARY STATISTICS (NATIONAL)
+# 6.  MUNICIPALITY PANEL
 # -------------------------------
-message("Starting Step 9: Generating National Summary Statistics...")
+message("Step 6: Build municipality panel…")
+mp <- plan_market_shares %>%
+  left_join(
+    plan_reajustes_avg,
+    by = c("id_plano","year")
+  ) %>%
+  group_by(cd_municipio,year) %>%
+  summarise(
+    readjustment      = weighted.mean(percentual_avg,w=market_share,na.rm=TRUE),
+    n_plans           = n(),
+    n_plans_with_readj= sum(!is.na(percentual_avg)),
+    coverage          = sum(market_share[!is.na(percentual_avg)],na.rm=TRUE),
+    treatment_status  = first(treatment_status),
+    treated           = first(treated),
+    .groups="drop"
+  ) %>%
+  mutate(
+    merger_year = 2022,
+    event_time  = year - merger_year,
+    post        = year >= merger_year
+  )
 
-if (exists("municipality_panel_with_chars") && nrow(municipality_panel_with_chars) > 0) {
-  summary_stats <- municipality_panel_with_chars %>% 
-    filter(treatment_status %in% c("Treated", "Control")) %>% 
-    group_by(treatment_status, year) %>%
-    summarize(
-      n_municipalities = n(),
-      avg_readjustment = mean(readjustment_rate, na.rm = TRUE), 
-      avg_n_plans = mean(total_plans, na.rm = TRUE),
-      avg_n_plans_with_readj = mean(plans_with_readjustment, na.rm = TRUE), 
-      .groups = "drop"
-    )
-  
-  print("Summary Statistics (National):")
-  print(summary_stats)
-  
-} else {
-  warning("Final national panel is empty or does not exist. Skipping summary statistics.")
-}
+# attach GDP
+pib <- read_csv(here("data","raw_data","municipios","br_ibge_pib_municipio.csv")) %>%
+  clean_names() %>%
+  filter(ano==2020) %>%
+  mutate(cd_municipio=as.numeric(substr(id_municipio,1,6))) %>%
+  select(cd_municipio,pib)
 
-message("National analysis complete!")
+mp <- mp %>%
+  left_join(pib,by="cd_municipio") %>%
+  rename(municipality_gdp=pib)
 
-# [End of Script]
+# Export to Stata
+message("Step 7: Export panels to Stata…")
+write_dta(
+  mp,
+  here("data","processed_data","national","municipality_panel_event_study_unbalanced.dta")
+)
+balanced_ids <- mp %>%
+  count(cd_municipio) %>%
+  filter(n==length(unique(mp$year))) %>%
+  pull(cd_municipio)
+
+write_dta(
+  filter(mp,cd_municipio %in% balanced_ids),
+  here("data","processed_data","national","municipality_panel_event_study_balanced.dta")
+)
+
+
+# -------------------------------
+# 8.  NATIONAL TREATMENT MAP
+# -------------------------------
+message("Step 8: Plot national treatment map…")
+br_munis  <- read_municipality(code_muni="all",year=2020) %>%
+  mutate(cd_municipio = as.numeric(substr(code_muni,1,nchar(code_muni)-1)))
+
+map_data  <- municipality_treatment %>%
+  mutate(cd_municipio=as.numeric(cd_municipio))
+
+br_map    <- left_join(br_munis,map_data,by=c("cd_municipio"))
+
+treatment_map_br <- ggplot(br_map) +
+  geom_sf(aes(fill=treatment_status), color=NA, size=0.01) +
+  geom_sf(data=read_state(year=2020), fill=NA, color="white", size=0.3) +
+  scale_fill_manual(
+    values=c("Treated"="orange","Control"="darkcyan","Out of Sample"="lightgrey"),
+    name="Treatment"
+  ) +
+  labs(
+    title    = "Treatment Status – Brazil",
+    subtitle = "(Hapvida & GNDI ≥50 beneficiaries in 2020)"
+  ) +
+  theme_void() +
+  theme(legend.position="bottom")
+
+ggsave(
+  here("data","images","national","treatment_status_map_BR.png"),
+  treatment_map_br, width=8, height=8, dpi=300
+)
+
+
+# -------------------------------
+# 9.  SUMMARY STATS
+# -------------------------------
+message("Step 9: Summary statistics…")
+mp %>%
+  filter(treatment_status %in% c("Treated","Control")) %>%
+  group_by(treatment_status,year) %>%
+  summarise(
+    n_municipalities       = n(),
+    avg_readjustment_rate  = mean(readjustment,na.rm=TRUE),
+    avg_plans              = mean(n_plans,na.rm=TRUE),
+    avg_plans_with_readj   = mean(n_plans_with_readj,na.rm=TRUE)
+  ) %>%
+  print()
+
+message("All done — national pipeline complete!")
+
+
+# 1) For each file, grab its cleaned column names
+cols_list <- lapply(r_files, function(path) {
+  # read only schema for speed
+  tbl <- read_parquet(path, as_data_frame = FALSE)
+  clean_names(as.data.frame(tbl)[0, ]) %>% names()
+})
+
+# 2) Compute the set of *all* unique column names across every file
+all_unique_cols <- sort(unique(unlist(cols_list)))
+
+# 3) Print them out
+cat("All unique column names across your Parquet files:\n")
+cat(paste0(" - ", all_unique_cols), sep = "\n")
+
+aux <- read_parquet(here('data', 'processed_data', 'national', 'beneficiarios_filtered_2015_2024.parquet'))
+aux %>% glimpse()
