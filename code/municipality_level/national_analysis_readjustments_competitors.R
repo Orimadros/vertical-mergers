@@ -12,19 +12,22 @@ library(sf)
 # -------------------------------
 # 1.  LOAD PROCESSED READJUSTMENTS
 # -------------------------------
-message("Step 1: Load processed readjustments…")
+
+message("Step 5: Load processed readjustments & compute averages…")
+# your 11M‐row reajustes panel
 reaj <- open_dataset(
   here("data","processed_data","national","reajustes_panel_final.parquet")
 )
 
-relevant_plans <- reaj %>% 
-  distinct(id_plano) %>% 
-  pull()
+# Relevant plans are large employer-sponsored plans with hospital coverage. The
+# readjustment dataset is already filtered for these plans.
+relevant_plans <- reaj %>% distinct(id_plano) %>% pull()
 
 # -------------------------------
 # 2.  LOAD PROCESSED BENEFICIARIES
 # -------------------------------
 message("Step 2: Load filtered beneficiaries…")
+
 beneficiarios <- open_dataset(
   here("data","processed_data","national","beneficiarios_filtered_2015_2024.parquet")
 ) %>%
@@ -47,15 +50,13 @@ baseline_insurer_presence <- beneficiarios %>%
   collect() %>%
   left_join(baseline_total_benefs, by="cd_municipio") %>%
   mutate(
-    market_share = ifelse(total_benef > 0,
-                          insurer_benef / total_benef,
-                          0),
-    insurer_type = case_when(
+    market_share  = ifelse(total_benef>0, insurer_benef/total_benef, 0),
+    insurer_type  = case_when(
       cd_operadora == "368253" ~ "Hapvida",
       cd_operadora == "359017" ~ "GNDI",
       TRUE                     ~ "Other"
     ),
-    has_presence = insurer_benef >= 50
+    has_presence  = insurer_benef >= 50
   )
 
 municipality_treatment <- baseline_insurer_presence %>%
@@ -81,196 +82,228 @@ municipality_treatment <- baseline_insurer_presence %>%
 # -------------------------------
 # 4.  PLAN MARKET SHARES
 # -------------------------------
-message("Step 4: Compute plan market shares…")
-total_benef_by_mun_year <- beneficiarios %>%
+
+# 4a) Competitors only
+message("Step 4a: Compute plan market shares – competitors only…")
+total_benef_by_mun_year_comp <- beneficiarios %>%
+  filter(!cd_operadora %in% c("368253","359017")) %>%
   group_by(cd_municipio, year) %>%
-  summarise(total_benef = sum(qt_beneficiario_ativo, na.rm=TRUE)) %>%
+  summarise(total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
   collect()
 
-plan_market_shares <- beneficiarios %>%
-  filter(!is.na(id_plano)) %>%
+plan_market_shares_comp <- beneficiarios %>%
+  filter(!is.na(id_plano),
+         !cd_operadora %in% c("368253","359017")) %>%
   group_by(cd_municipio, year, id_plano, cd_operadora) %>%
-  summarise(plan_benef = sum(qt_beneficiario_ativo, na.rm=TRUE)) %>%
+  summarise(plan_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
   collect() %>%
-  left_join(total_benef_by_mun_year, by=c("cd_municipio","year")) %>%
+  left_join(total_benef_by_mun_year_comp, by = c("cd_municipio","year")) %>%
   mutate(
-    market_share = ifelse(total_benef>0,
-                          plan_benef/total_benef,
-                          0),
-    insurer = case_when(
+    market_share = ifelse(total_benef>0, plan_benef/total_benef, 0),
+    insurer      = "Other"
+  ) %>%
+  left_join(municipality_treatment %>% select(cd_municipio, treatment_status, treated),
+            by = "cd_municipio")
+
+# 4b) Hapvida & GNDI only
+message("Step 4b: Compute plan market shares – Hapvida & GNDI only…")
+total_benef_by_mun_year_hapgndi <- beneficiarios %>%
+  filter(cd_operadora %in% c("368253","359017")) %>%
+  group_by(cd_municipio, year) %>%
+  summarise(total_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+  collect()
+
+plan_market_shares_hapgndi <- beneficiarios %>%
+  filter(!is.na(id_plano),
+         cd_operadora %in% c("368253","359017")) %>%
+  group_by(cd_municipio, year, id_plano, cd_operadora) %>%
+  summarise(plan_benef = sum(qt_beneficiario_ativo, na.rm = TRUE)) %>%
+  collect() %>%
+  left_join(total_benef_by_mun_year_hapgndi, by = c("cd_municipio","year")) %>%
+  mutate(
+    market_share = ifelse(total_benef>0, plan_benef/total_benef, 0),
+    insurer      = case_when(
       cd_operadora == "368253" ~ "Hapvida",
-      cd_operadora == "359017" ~ "GNDI",
-      TRUE                     ~ "Other"
-    ),
-    merged_insurer = ifelse(
-      year >= 2021 & insurer %in% c("Hapvida","GNDI"),
-      "HAP-GNDI-merged",
-      insurer
+      cd_operadora == "359017" ~ "GNDI"
     )
   ) %>%
-  left_join(
-    municipality_treatment %>% select(cd_municipio, treatment_status, treated),
-    by = "cd_municipio"
-  )
+  left_join(municipality_treatment %>% select(cd_municipio, treatment_status, treated),
+            by = "cd_municipio")
 
-# -------------------------------
-# 5.  MUNICIPALITY PANEL
-# -------------------------------
-message("Step 5: Build municipality panels…")
-plan_reajustes_avg <- reaj %>%
-  group_by(year, id_plano) %>%
-  summarise(
-    total_benef  = sum(benef_comunicado, na.rm = TRUE),
-    weighted_sum = sum(percentual * benef_comunicado, na.rm = TRUE),
-    percentual_avg = weighted_sum / total_benef
-  ) %>%
-  select(year, id_plano, percentual_avg) %>%
-  ungroup() %>%
-  collect()
+# determine how many years the full event‐study spans
+years_panel <- plan_reajustes_avg %>% distinct(year) %>% nrow()
 
-ps <- plan_market_shares %>%
-  left_join(plan_reajustes_avg, by = c("id_plano","year"))
-
-# 5a-i) Panel 1: only Hapvida & GNDI
-mp_hapgndi <- ps %>%
-  filter(insurer %in% c("Hapvida","GNDI")) %>%
+# 5a) Municipality panel – competitors (balanced to full panel, drop any muni with missing readjustment)
+mp_comp <- plan_market_shares_comp %>%
+  left_join(plan_reajustes_avg, by = c("id_plano","year")) %>%
   group_by(cd_municipio, year) %>%
   summarise(
-    readjustment     = weighted.mean(percentual_avg, w = market_share, na.rm = TRUE),
-    n_plans          = n(),
-    coverage         = sum(market_share, na.rm = TRUE),
-    treatment_status = first(treatment_status),
-    treated          = first(treated),
-    .groups          = "drop"
+    readjustment       = weighted.mean(percentual_avg, w = market_share, na.rm = TRUE),
+    n_plans            = n(),
+    n_plans_with_readj = sum(!is.na(percentual_avg)),
+    coverage           = sum(market_share[!is.na(percentual_avg)], na.rm = TRUE),
+    treatment_status   = first(treatment_status),
+    treated            = first(treated),
+    .groups            = "drop"
   ) %>%
   mutate(
     merger_year = 2022,
-    timeToTreat = ifelse(treated == 1, year - merger_year, NA_real_)
+    timeToTreat = ifelse(treated==1, year - merger_year, NA_real_)
   ) %>%
   left_join(pib, by = "cd_municipio") %>%
   group_by(cd_municipio) %>%
   fill(gdp_2020, .direction = "downup") %>%
   ungroup() %>%
-  left_join(
-    beneficiarios %>% 
-      select(cd_municipio, sg_uf) %>% 
-      distinct() %>% 
-      collect(),
-    by = "cd_municipio"
-  )
+  left_join(muni_states, by = "cd_municipio") %>%
+  group_by(cd_municipio) %>%
+  filter(
+    n() == years_panel,                 # balanced full span
+    all(!is.na(readjustment))           # no missing readjustment in any year
+  ) %>%
+  ungroup() %>%
+  filter(treatment_status %in% c("Treated","Control"))
 
-# 5a-ii) Panel 2: all other plans
-mp_other <- ps %>%
-  filter(insurer == "Other") %>%
+# 5b) Municipality panel – Hapvida & GNDI (balanced to full panel, drop any muni with missing readjustment)
+mp_hapgndi <- plan_market_shares_hapgndi %>%
+  left_join(plan_reajustes_avg, by = c("id_plano","year")) %>%
   group_by(cd_municipio, year) %>%
   summarise(
-    readjustment     = weighted.mean(percentual_avg, w = market_share, na.rm = TRUE),
-    n_plans          = n(),
-    coverage         = sum(market_share, na.rm = TRUE),
-    treatment_status = first(treatment_status),
-    treated          = first(treated),
-    .groups          = "drop"
+    readjustment       = weighted.mean(percentual_avg, w = market_share, na.rm = TRUE),
+    n_plans            = n(),
+    n_plans_with_readj = sum(!is.na(percentual_avg)),
+    coverage           = sum(market_share[!is.na(percentual_avg)], na.rm = TRUE),
+    treatment_status   = first(treatment_status),
+    treated            = first(treated),
+    .groups            = "drop"
   ) %>%
   mutate(
     merger_year = 2022,
-    timeToTreat = ifelse(treated == 1, year - merger_year, NA_real_)
+    timeToTreat = ifelse(treated==1, year - merger_year, NA_real_)
   ) %>%
   left_join(pib, by = "cd_municipio") %>%
   group_by(cd_municipio) %>%
   fill(gdp_2020, .direction = "downup") %>%
   ungroup() %>%
-  left_join(
-    beneficiarios %>% 
-      select(cd_municipio, sg_uf) %>% 
-      distinct() %>% 
-      collect(),
-    by = "cd_municipio"
-  )
+  left_join(muni_states, by = "cd_municipio") %>%
+  group_by(cd_municipio) %>%
+  filter(
+    n() == years_panel,
+    all(!is.na(readjustment))
+  ) %>%
+  ungroup() %>%
+  filter(treatment_status %in% c("Treated","Control"))
 
 # -------------------------------
 # 6.  EXPORT TO STATA
 # -------------------------------
-message("Step 6: Export to Stata…")
-write_dta(mp_hapgndi, here("data","processed_data","national","mp_hapgndi.dta"))
-write_dta(mp_other,  here("data","processed_data","national","mp_other.dta"))
+message("Step 6: Export both panels to Stata…")
+write_dta(mp_comp,     here("data","processed_data","national","dta","municipality_panel_competitors.dta"))
+write_dta(mp_hapgndi,  here("data","processed_data","national","dta","municipality_panel_hapgndi.dta"))
 
 # -------------------------------
-# 7.  NATIONAL TREATMENT MAP
+# 7.  SANITY CHECKS FOR PANELS
 # -------------------------------
-message("Step 7: Plot national treatment map…")
-br_munis <- read_municipality(code_muni = "all", year = 2020) %>%
-  mutate(cd_municipio = as.numeric(substr(code_muni,1,nchar(code_muni)-1)))
-map_data <- municipality_treatment %>%
-  mutate(cd_municipio = as.numeric(cd_municipio))
-br_map <- br_munis %>%
-  left_join(map_data, by = "cd_municipio") %>%
-  mutate(
-    treatment_status = replace_na(treatment_status, "Out of Sample"),
-    treatment_status = factor(treatment_status,
-                              levels = c("Treated","Control","Out of Sample"))
-  )
-treatment_map_br <- ggplot(br_map) +
-  geom_sf(aes(fill = treatment_status), color = NA, size = 0.01) +
-  geom_sf(data = read_state(year = 2020),
-          fill = NA, color = "white", size = 0.3) +
-  scale_fill_manual(values = c(
-    Treated         = "orange",
-    Control         = "darkcyan",
-    `Out of Sample` = "lightgrey"
-  ), name = "Treatment") +
-  labs(
-    title    = "Treatment Status – Brazil",
-    subtitle = "(Hapvida & GNDI ≥50 beneficiaries in 2020)"
-  ) +
-  theme_classic() +
-  theme(
-    legend.position = "bottom",
-    axis.line        = element_blank(),
-    axis.text        = element_blank(),
-    axis.ticks       = element_blank(),
-    axis.title       = element_blank()
-  )
-ggsave(
-  here("data","images","national","treatment_status_map_BR.png"),
-  treatment_map_br,
-  width = 8, height = 8, dpi = 1000
-)
+message("Step 9: Sanity checks for both panels…")
+
+# 9a) Municipalities per year
+message("– Competitors panel: municipalities per year")
+mp_comp %>%
+  count(year) %>%
+  rename(n_municipalities = n) %>%
+  print()
+
+message("– Hapvida & GNDI panel: municipalities per year")
+mp_hapgndi %>%
+  count(year) %>%
+  rename(n_municipalities = n) %>%
+  print()
+
+# 9b) Distinct municipalities overall
+message("– Competitors panel: distinct municipalities")
+mp_comp %>%
+  summarise(distinct_munis = n_distinct(cd_municipio)) %>%
+  print()
+
+message("– Hapvida & GNDI panel: distinct municipalities")
+mp_hapgndi %>%
+  summarise(distinct_munis = n_distinct(cd_municipio)) %>%
+  print()
+
+# 9c) Quintiles of n_plans
+probs <- seq(0, 1, 0.2)
+
+message("– Competitors panel: quintiles of n_plans")
+quantile(mp_comp$n_plans, probs = probs, na.rm = TRUE) %>%
+  enframe(name = "quantile", value = "n_plans") %>%
+  print()
+
+message("– Hapvida & GNDI panel: quintiles of n_plans")
+quantile(mp_hapgndi$n_plans, probs = probs, na.rm = TRUE) %>%
+  enframe(name = "quantile", value = "n_plans") %>%
+  print()
 
 # -------------------------------
-# 8.  SANITY CHECKS
+# 9x. SANITY CHECKS – READJUSTMENT DISTRIBUTIONS
 # -------------------------------
-message("Step 8: Sanity checks…")
+message("Readjustment summary – Competitors panel")
+mp_comp %>%
+  summarise(
+    obs               = n(),
+    missing           = sum(is.na(readjustment)),
+    pct_missing       = 100 * missing / obs,
+    mean_readj        = mean(readjustment,   na.rm = TRUE),
+    sd_readj          = sd(readjustment,     na.rm = TRUE),
+    median_readj      = median(readjustment, na.rm = TRUE),
+    min_readj         = min(readjustment,    na.rm = TRUE),
+    p20_readj         = quantile(readjustment, 0.20, na.rm = TRUE),
+    p40_readj         = quantile(readjustment, 0.40, na.rm = TRUE),
+    p60_readj         = quantile(readjustment, 0.60, na.rm = TRUE),
+    p80_readj         = quantile(readjustment, 0.80, na.rm = TRUE),
+    max_readj         = max(readjustment,    na.rm = TRUE)
+  ) %>%
+  print()
 
-# 8a) counts by year & treatment_status
-mp_hapgndi %>% count(year, treatment_status) %>% arrange(year, treatment_status) %>% print()
-mp_other    %>% count(year, treatment_status) %>% arrange(year, treatment_status) %>% print()
+message("Readjustment by year – Competitors panel")
+mp_comp %>%
+  group_by(year) %>%
+  summarise(
+    n                = n(),
+    mean_readj       = mean(readjustment, na.rm = TRUE),
+    sd_readj         = sd(readjustment,   na.rm = TRUE),
+    median_readj     = median(readjustment, na.rm = TRUE),
+    pct_missing_readj = 100 * sum(is.na(readjustment)) / n
+  ) %>%
+  print()
 
-# 8b) missing‐readjustment diagnostics
+message("Readjustment summary – Hapvida & GNDI panel")
 mp_hapgndi %>%
   summarise(
-    total_obs     = n(),
-    missing_readj = sum(is.na(readjustment)),
-    pct_missing   = 100 * missing_readj/total_obs
-  ) %>% print()
-mp_other %>%
-  summarise(
-    total_obs     = n(),
-    missing_readj = sum(is.na(readjustment)),
-    pct_missing   = 100 * missing_readj/total_obs
-  ) %>% print()
+    obs               = n(),
+    missing           = sum(is.na(readjustment)),
+    pct_missing       = 100 * missing / obs,
+    mean_readj        = mean(readjustment,   na.rm = TRUE),
+    sd_readj          = sd(readjustment,     na.rm = TRUE),
+    median_readj      = median(readjustment, na.rm = TRUE),
+    min_readj         = min(readjustment,    na.rm = TRUE),
+    p20_readj         = quantile(readjustment, 0.20, na.rm = TRUE),
+    p40_readj         = quantile(readjustment, 0.40, na.rm = TRUE),
+    p60_readj         = quantile(readjustment, 0.60, na.rm = TRUE),
+    p80_readj         = quantile(readjustment, 0.80, na.rm = TRUE),
+    max_readj         = max(readjustment,    na.rm = TRUE)
+  ) %>%
+  print()
 
-# 8c) distribution of readjustments
+message("Readjustment by year – Hapvida & GNDI panel")
 mp_hapgndi %>%
-  summarise(min = min(readjustment, na.rm=TRUE),
-            q1  = quantile(readjustment, .25, na.rm=TRUE),
-            med = median(readjustment, na.rm=TRUE),
-            q3  = quantile(readjustment, .75, na.rm=TRUE),
-            max = max(readjustment, na.rm=TRUE)) %>% print()
-mp_other %>%
-  summarise(min = min(readjustment, na.rm=TRUE),
-            q1  = quantile(readjustment, .25, na.rm=TRUE),
-            med = median(readjustment, na.rm=TRUE),
-            q3  = quantile(readjustment, .75, na.rm=TRUE),
-            max = max(readjustment, na.rm=TRUE)) %>% print()
+  group_by(year) %>%
+  summarise(
+    n                = n(),
+    mean_readj       = mean(readjustment, na.rm = TRUE),
+    sd_readj         = sd(readjustment,   na.rm = TRUE),
+    median_readj     = median(readjustment, na.rm = TRUE),
+    pct_missing_readj = 100 * sum(is.na(readjustment)) / n
+  ) %>%
+  print()
+mp_hapgndi %>% 
+  filter(is.na(readjustment))
 
-message("Pipeline complete.")

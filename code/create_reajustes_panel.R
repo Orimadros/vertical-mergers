@@ -1,21 +1,15 @@
 # -------------------------------
 # 0. Load Libraries & Setup Paths
 # -------------------------------
-library(dplyr)
+library(tidyverse)
 library(arrow)
-library(lubridate)
 library(here)
-library(purrr)
 library(janitor)
-library(tidyr) # For unnest_longer if needed, and potentially pivot_wider/longer if schemas were very different
 
 # Define paths
 reajustes_raw_dir <- here("data", "raw_data", "ANS", "operadoras", "reajustes", "reajustes_parquet")
 output_dir <- here("data", "processed_data", "national")
 output_file <- file.path(output_dir, "reajustes_panel_final.parquet")
-
-# Ensure output directory exists
-dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
 
 # -------------------------------
 # 1. Generate and Find All Monthly File Paths (2015-01 to 2024-11)
@@ -142,6 +136,19 @@ reajustes_cleaned <- reajustes_std %>%
 
 message("After retification handling and duplicate removal: ", nrow(reajustes_cleaned), " rows remaining.")
 
+na_profile <- reajustes_cleaned %>%
+  summarise(across(everything(),
+                   list(n_missing = ~sum(is.na(.)),
+                        pct_missing = ~mean(is.na(.))),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "^(.*)_(n_missing|pct_missing)$"
+  ) %>%
+  arrange(desc(pct_missing))
+
+
 # -------------------------------
 # 5. Final Selection and Save
 # -------------------------------
@@ -154,7 +161,7 @@ final_panel <- reajustes_cleaned %>%
     id_contrato, id_plano, cd_operadora, year,
     benef_comunicado = benef_comunicado_final,
     percentual = percentual_final,
-    lg_retificacao,sg_uf_contrato_reaj
+    lg_retificacao,sg_uf_contrato_reaj, lg_fator_moderador
     )
 
 # Save the final panel
