@@ -19,6 +19,7 @@ reaj <- open_dataset(
   here("data","processed_data","national","reajustes_panel_final.parquet")
 )
 
+
 # Relevant plans are large employer-sponsored plans with hospital coverage. The
 # readjustment dataset is already filtered for these plans.
 relevant_plans <- reaj %>% distinct(id_plano) %>% pull()
@@ -31,7 +32,31 @@ message("Step 2: Load filtered beneficiaries…")
 beneficiarios <- open_dataset(
   here("data","processed_data","national","beneficiarios_filtered_2015_2024.parquet")
 ) %>%
-  filter(id_plano %in% relevant_plans)
+  filter(id_plano %in% relevant_plans,
+         qt_beneficiario_ativo > 0)
+
+# -------------------------------
+# 3.  LOAD NETWORKS DATASET
+# -------------------------------
+
+message("Step 5: Load networks dataset…")
+networks_dir <- here('data', 
+                    'raw_data',
+                    'ANS',
+                    'prestadores',
+                    'produtos e prestadores hospitalares',
+                    'produtos_prestadores_parquet')
+
+# Load all Parquet files into a tibble
+networks <- open_dataset(networks_dir)
+networks <- networks %>%
+  filter(
+    de_tipo_contratacao == 'COLETIVO EMPRESARIAL',
+    de_clas_estb_saude == 'Assistencia Hospitalar',
+    id_plano %in% relevant_plans
+  )
+
+networks %>% glimpse()
 
 # -------------------------------
 # 3.  IDENTIFY TREATMENT GROUPS
@@ -52,9 +77,9 @@ baseline_insurer_presence <- beneficiarios %>%
   mutate(
     market_share  = ifelse(total_benef>0, insurer_benef/total_benef, 0),
     insurer_type  = case_when(
-      cd_operadora == "368253" ~ "Hapvida",
-      cd_operadora == "359017" ~ "GNDI",
-      TRUE                     ~ "Other"
+      cd_operadora == "368253"                ~ "Hapvida",
+      cd_operadora %in% c("359017", "348520") ~ "GNDI",
+      TRUE                                    ~ "Other"
     ),
     has_presence  = insurer_benef >= 50
   )
@@ -66,11 +91,11 @@ municipality_treatment <- baseline_insurer_presence %>%
     id_cols     = cd_municipio,
     names_from  = insurer_type,
     values_from = has_presence,
+    # collapse duplicates by taking max(TRUE/FALSE) and fill missing with FALSE
+    values_fn   = max,
     values_fill = FALSE
   ) %>%
   mutate(
-    Hapvida        = coalesce(Hapvida, FALSE),
-    GNDI           = coalesce(GNDI,    FALSE),
     treatment_status = case_when(
       Hapvida & GNDI ~ "Treated",
       Hapvida | GNDI ~ "Control",
@@ -78,6 +103,7 @@ municipality_treatment <- baseline_insurer_presence %>%
     ),
     treated = as.numeric(treatment_status == "Treated")
   )
+
 
 # -------------------------------
 # 4.  PLAN MARKET SHARES
@@ -97,9 +123,9 @@ plan_market_shares <- beneficiarios %>%
   mutate(
     market_share = ifelse(total_benef>0, plan_benef/total_benef, 0),
     insurer      = case_when(
-      cd_operadora == "368253" ~ "Hapvida",
-      cd_operadora == "359017" ~ "GNDI",
-      TRUE                     ~ "Other"
+      cd_operadora == "368253"                ~ "Hapvida",
+      cd_operadora %in% c("359017", "348520") ~ "GNDI",
+      TRUE                                    ~ "Other"
     ),
     merged_insurer = ifelse(
       year >= 2021 & insurer %in% c("Hapvida","GNDI"),
@@ -111,6 +137,25 @@ plan_market_shares <- beneficiarios %>%
     municipality_treatment %>% select(cd_municipio, treatment_status, treated),
     by = "cd_municipio"
   )
+
+# right after you collect both tables:
+total_benef_by_mun_year <- total_benef_by_mun_year %>%
+  mutate(
+    cd_municipio = as.integer(cd_municipio),
+    year         = as.integer(year)
+  )
+
+plan_market_shares <- plan_market_shares %>%
+  mutate(
+    cd_municipio = as.integer(cd_municipio),
+    year         = as.integer(year)
+  )
+
+# optionally, check for any stray missing keys
+plan_market_shares %>% 
+  filter(is.na(cd_municipio) | is.na(year)) %>% 
+  distinct(cd_municipio, year)
+
 
 # -------------------------------
 # 5.  MUNICIPALITY PANEL
@@ -174,6 +219,73 @@ muni_states <- beneficiarios %>%
 mp <- mp %>%
   left_join(muni_states, by = "cd_municipio")
 
+benef_per_munic_year <- beneficiarios %>%
+  group_by(cd_municipio, year) %>%
+  summarize(total_benef = sum(qt_beneficiario_ativo)) %>%
+  collect()
+
+mp <- mp %>% left_join(benef_per_munic_year, by = c("cd_municipio", "year"))
+
+# --- compute beneficiary HHI by municipality & year, with merger after 2021
+benef_hhi <- beneficiarios %>%
+  # 1) define a merged‐insurer identifier
+  mutate(
+    insurer_group = case_when(
+      cd_operadora %in% c("359017","348520","368253") & year >= 2022 ~ "HAP_GNDI_merged",
+      cd_operadora %in% c("359017","348520") & year <= 2022          ~ "GNDI",
+      TRUE                                                           ~ as.character(cd_operadora)
+    )
+  ) %>%
+  # 2) sum beneficiaries at the muni–year–insurer_group level
+  group_by(cd_municipio, year, insurer_group) %>%
+  summarise(
+    insurer_benef = sum(qt_beneficiario_ativo, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # 3) compute total beneficiaries per muni–year
+  group_by(cd_municipio, year) %>%
+  mutate(total_benef = sum(insurer_benef)) %>%
+  # 4) HHI = sum of squared shares
+  summarise(
+    benef_HHI = sum( (insurer_benef / total_benef)^2 ),
+    .groups   = "drop"
+  ) %>%
+  # 5) pull into a local tibble so it shares the same backend as `mp`
+  collect()
+
+# --- join HHI back into your municipality panel
+mp <- mp %>%
+  left_join(benef_hhi, by = c("cd_municipio", "year"))
+
+# 1. Compute total and Hapvida+GNDI benhapgndi_share.y# 1. Compute total and Hapvida+GNDI beneficiaries by muni × year in the Arrow dataset
+hapgndi_share <- beneficiarios %>%
+  group_by(cd_municipio, year) %>%
+  summarise(
+    total_benef   = sum(qt_beneficiario_ativo, na.rm = TRUE),
+    hapgndi_benef = sum(
+      if_else(
+        cd_operadora %in% c("368253", "359017", "348520"),
+        qt_beneficiario_ativo,
+        0
+      ),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  # now pull the small result into R
+  collect() %>%
+  mutate(
+    hapgndi_share = if_else(total_benef > 0,
+                            hapgndi_benef / total_benef,
+                            0)
+  ) %>%
+  select(cd_municipio, year, hapgndi_share)
+
+# 2. Join into your panel
+mp <- mp %>%
+  left_join(hapgndi_share,
+            by = c("cd_municipio", "year"))
+
 # -------------------------------
 # 6.  EXPORT TO STATA (ONLY IN‐SAMPLE MUNICIPALITIES)
 # -------------------------------
@@ -185,7 +297,7 @@ mp_sample <- mp %>%
 
 write_dta(
   mp_sample,
-  here("data","processed_data","national","municipality_panel_event_study.dta")
+  here("data","processed_data","national","dta","municipality_panel_event_study_all_GNDIMG.dta")
 )
 
 # -------------------------------
@@ -243,7 +355,7 @@ treatment_map_br <- ggplot(br_map) +
 
 # save
 ggsave(
-  here("data","images","national","treatment_status_map_BR.png"),
+  here("data","images","national","maps","treatment_status_map_BR.png"),
   treatment_map_br,
   width = 8, height = 8, dpi = 1000
 )
@@ -306,7 +418,4 @@ mp %>%
     sd_plans           = sd(n_plans, na.rm=TRUE)
   ) %>%
   print()
-
-message("Sanity checks complete — national pipeline still running!")
-
 
